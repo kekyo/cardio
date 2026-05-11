@@ -1,0 +1,39 @@
+{
+  "configurations": [
+    {
+      "name": "POSIX (Linux)",
+      "compilerPath": "/usr/bin/g++",
+      "intelliSenseMode": "linux-gcc-x64",
+      "cStandard": "c99",
+      "cppStandard": "c++20",
+      "defines": [
+        "CARDIO_WITH_LINUX_IO_URING=1",
+        "CARDIO_WITH_GLIB=1",
+        "CARDIO_WITH_GIO=1"
+      ],
+      "includePath": [
+        "${workspaceFolder}/**",
+        "/usr/include/glib-2.0",
+        "/usr/lib/x86_64-linux-gnu/glib-2.0/include",
+        "/usr/include/gio-unix-2.0",
+        "/usr/include/libmount",
+        "/usr/include/blkid"
+      ]
+    },
+    {
+      "name": "Win32 x64 (MinGW)",
+      "compilerPath": "/usr/bin/x86_64-w64-mingw32-g++",
+      "intelliSenseMode": "windows-gcc-x64",
+      "cStandard": "c99",
+      "cppStandard": "c++20",
+      "defines": [
+        "_WIN32",
+        "_WIN64"
+      ],
+      "includePath": [
+        "${workspaceFolder}/**"
+      ]
+    }
+  ],
+  "version": 4
+}
