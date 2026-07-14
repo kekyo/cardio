@@ -1235,6 +1235,7 @@ Win32 helpers are available only when `CARDIO_HAS_WIN32_HANDLE=1` is defined.
 |:----|:----|
 | `promises::delay()` | Returns a promise that waits for the specified time in milliseconds. |
 | `promises::all()` | Returns a promise that resolves when all input promises resolve, similar to JavaScript `Promise.all()`. |
+| `promises::start_new()` | Runs a callable on a new worker thread and returns a promise for its result. |
 | `cancellations::timeout()` | Returns a `cancellation_source` that requests cancellation after the specified time in milliseconds, similar to JavaScript `AbortSignal.timeout()`. |
 | `cancellations::any()` | Returns a `cancellation_source` that is canceled when any input `cancellation` is canceled, similar to JavaScript `AbortSignal.any()`. |
 | `io_urings::submit()` | Submits a raw single-shot io_uring operation and returns its completion fields. |
@@ -1288,6 +1289,49 @@ Elapsed time is observed only while the dispatcher is parked. The
 `cancellation_source` returned by `cancellations::timeout()` enters the
 canceled state when the dispatcher processes the expired timer, and registered
 callbacks are then queued to the dispatcher that registered them.
+
+### Starting work on a worker thread
+
+`promises::start_new()` creates a new worker thread for one callable and returns
+a promise that belongs to the caller's current dispatcher.
+This is useful for running blocking or CPU-bound work without making it part of cardio's core
+dispatcher implementation.
+
+```cpp
+static cardio::promise<int> worker_async() {
+  co_await cardio::promises::delay(10);
+  co_return 42;
+}
+
+int main() {
+  cardio::dispatcher_host d;
+
+  auto result = cardio::promises::start_new([] {
+    return worker_async();
+  });
+
+  d.park();
+
+  printf("result = %d\n", result.unsafe_result());
+  return 0;
+}
+```
+
+The callable may return a value, `void`, `promise<T>`, or `promise<void>`.
+When it returns a promise, `start_new()` installs an independent dispatcher on the
+worker thread and parks it until that promise completes.
+`start_new()` creates thread per call and does not use a thread pool.
+
+Cancellation is cooperative. Capture a `cardio::cancellation` in the callable and
+pass it to cancellation-aware operations, or actively check it in your own work.
+If you intentionally do not need the result, the returned promise can also be
+kept alive with `fire_and_forget()`:
+
+```cpp
+cardio::fire_and_forget(cardio::promises::start_new([] {
+  return worker_async();
+}));
+```
 
 ---
 
