@@ -9628,7 +9628,7 @@ struct file_contents {
   std::string etag;
 };
 
-namespace detail {
+namespace internal {
   inline bool has_gio_feature() {
     return (get_current_dispatcher().get_feature() & dispatcher_feature::gio) !=
            dispatcher_feature::none;
@@ -9889,7 +9889,7 @@ namespace detail {
         std::move(start), std::move(finish), &cancellation_signal);
   }
 #endif
-}  // namespace detail
+}  // namespace internal
 
 /**
  * Submits a raw single-shot GIO asynchronous operation.
@@ -9910,7 +9910,7 @@ namespace detail {
  */
 template <typename T, typename Start, typename Finish>
 inline promise<T> submit(Start start, Finish finish) {
-  return detail::submit_impl<T>(std::move(start), std::move(finish), nullptr);
+  return internal::submit_impl<T>(std::move(start), std::move(finish), nullptr);
 }
 
 #if CARDIO_HAS_EXCEPTIONS
@@ -9935,7 +9935,7 @@ inline promise<T> submit(
     Start start,
     Finish finish,
     cancellation cancellation) {
-  return detail::submit_impl<T>(
+  return internal::submit_impl<T>(
       std::move(start), std::move(finish), &cancellation);
 }
 #endif
@@ -9953,10 +9953,10 @@ inline promise<std::size_t> read(
     std::span<std::byte> buffer,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (stream == nullptr) {
-    return detail::null_argument_promise<std::size_t>("stream");
+    return internal::null_argument_promise<std::size_t>("stream");
   }
-  if (!detail::is_valid_buffer_size(buffer.size())) {
-    return detail::too_large_size_promise<std::size_t>();
+  if (!internal::is_valid_buffer_size(buffer.size())) {
+    return internal::too_large_size_promise<std::size_t>();
   }
   auto* data = buffer.data();
   const auto size = buffer.size();
@@ -9975,7 +9975,7 @@ inline promise<std::size_t> read(
             user_data);
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
-        return detail::size_result(
+        return internal::size_result(
             g_input_stream_read_finish(
                 G_INPUT_STREAM(source_object), result, error),
             error,
@@ -9999,10 +9999,10 @@ inline promise<std::size_t> read(
     cancellation cancellation,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (stream == nullptr) {
-    return detail::null_argument_promise<std::size_t>("stream");
+    return internal::null_argument_promise<std::size_t>("stream");
   }
-  if (!detail::is_valid_buffer_size(buffer.size())) {
-    return detail::too_large_size_promise<std::size_t>();
+  if (!internal::is_valid_buffer_size(buffer.size())) {
+    return internal::too_large_size_promise<std::size_t>();
   }
   auto* data = buffer.data();
   const auto size = buffer.size();
@@ -10021,7 +10021,7 @@ inline promise<std::size_t> read(
             user_data);
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
-        return detail::size_result(
+        return internal::size_result(
             g_input_stream_read_finish(
                 G_INPUT_STREAM(source_object), result, error),
             error,
@@ -10044,10 +10044,10 @@ inline promise<std::size_t> read_all(
     std::span<std::byte> buffer,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (stream == nullptr) {
-    return detail::null_argument_promise<std::size_t>("stream");
+    return internal::null_argument_promise<std::size_t>("stream");
   }
-  if (!detail::is_valid_buffer_size(buffer.size())) {
-    return detail::too_large_size_promise<std::size_t>();
+  if (!internal::is_valid_buffer_size(buffer.size())) {
+    return internal::too_large_size_promise<std::size_t>();
   }
   auto* data = buffer.data();
   const auto size = buffer.size();
@@ -10067,7 +10067,7 @@ inline promise<std::size_t> read_all(
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
         auto bytes_read = gsize{};
-        detail::ensure_boolean_result(
+        internal::ensure_boolean_result(
             g_input_stream_read_all_finish(
                 G_INPUT_STREAM(source_object), result, &bytes_read, error),
             error,
@@ -10093,10 +10093,10 @@ inline promise<std::size_t> read_all(
     cancellation cancellation,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (stream == nullptr) {
-    return detail::null_argument_promise<std::size_t>("stream");
+    return internal::null_argument_promise<std::size_t>("stream");
   }
-  if (!detail::is_valid_buffer_size(buffer.size())) {
-    return detail::too_large_size_promise<std::size_t>();
+  if (!internal::is_valid_buffer_size(buffer.size())) {
+    return internal::too_large_size_promise<std::size_t>();
   }
   auto* data = buffer.data();
   const auto size = buffer.size();
@@ -10116,7 +10116,7 @@ inline promise<std::size_t> read_all(
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
         auto bytes_read = gsize{};
-        detail::ensure_boolean_result(
+        internal::ensure_boolean_result(
             g_input_stream_read_all_finish(
                 G_INPUT_STREAM(source_object), result, &bytes_read, error),
             error,
@@ -10143,10 +10143,10 @@ inline promise<GBytes*> read_bytes(
     std::size_t count,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (stream == nullptr) {
-    return detail::null_argument_promise<GBytes*>("stream");
+    return internal::null_argument_promise<GBytes*>("stream");
   }
-  if (!detail::is_valid_buffer_size(count)) {
-    return detail::too_large_size_promise<GBytes*>();
+  if (!internal::is_valid_buffer_size(count)) {
+    return internal::too_large_size_promise<GBytes*>();
   }
   return submit<GBytes*>(
       [stream, count, io_priority](
@@ -10183,10 +10183,10 @@ inline promise<GBytes*> read_bytes(
     cancellation cancellation,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (stream == nullptr) {
-    return detail::null_argument_promise<GBytes*>("stream");
+    return internal::null_argument_promise<GBytes*>("stream");
   }
-  if (!detail::is_valid_buffer_size(count)) {
-    return detail::too_large_size_promise<GBytes*>();
+  if (!internal::is_valid_buffer_size(count)) {
+    return internal::too_large_size_promise<GBytes*>();
   }
   return submit<GBytes*>(
       [stream, count, io_priority](
@@ -10222,10 +10222,10 @@ inline promise<std::size_t> skip(
     std::size_t count,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (stream == nullptr) {
-    return detail::null_argument_promise<std::size_t>("stream");
+    return internal::null_argument_promise<std::size_t>("stream");
   }
-  if (!detail::is_valid_buffer_size(count)) {
-    return detail::too_large_size_promise<std::size_t>();
+  if (!internal::is_valid_buffer_size(count)) {
+    return internal::too_large_size_promise<std::size_t>();
   }
   return submit<std::size_t>(
       [stream, count, io_priority](
@@ -10241,7 +10241,7 @@ inline promise<std::size_t> skip(
             user_data);
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
-        return detail::size_result(
+        return internal::size_result(
             g_input_stream_skip_finish(
                 G_INPUT_STREAM(source_object), result, error),
             error,
@@ -10259,7 +10259,7 @@ inline promise<std::size_t> skip(
 inline promise<void> close(
     GInputStream* stream,
     int io_priority = G_PRIORITY_DEFAULT) {
-  return detail::submit_checked<void>(
+  return internal::submit_checked<void>(
       stream,
       [stream, io_priority](
           GCancellable* cancellable,
@@ -10269,7 +10269,7 @@ inline promise<void> close(
             stream, io_priority, cancellable, callback, user_data);
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
-        detail::ensure_boolean_result(
+        internal::ensure_boolean_result(
             g_input_stream_close_finish(
                 G_INPUT_STREAM(source_object), result, error),
             error,
@@ -10290,10 +10290,10 @@ inline promise<std::size_t> write(
     std::span<const std::byte> buffer,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (stream == nullptr) {
-    return detail::null_argument_promise<std::size_t>("stream");
+    return internal::null_argument_promise<std::size_t>("stream");
   }
-  if (!detail::is_valid_buffer_size(buffer.size())) {
-    return detail::too_large_size_promise<std::size_t>();
+  if (!internal::is_valid_buffer_size(buffer.size())) {
+    return internal::too_large_size_promise<std::size_t>();
   }
   const auto* data = buffer.data();
   const auto size = buffer.size();
@@ -10312,7 +10312,7 @@ inline promise<std::size_t> write(
             user_data);
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
-        return detail::size_result(
+        return internal::size_result(
             g_output_stream_write_finish(
                 G_OUTPUT_STREAM(source_object), result, error),
             error,
@@ -10336,10 +10336,10 @@ inline promise<std::size_t> write(
     cancellation cancellation,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (stream == nullptr) {
-    return detail::null_argument_promise<std::size_t>("stream");
+    return internal::null_argument_promise<std::size_t>("stream");
   }
-  if (!detail::is_valid_buffer_size(buffer.size())) {
-    return detail::too_large_size_promise<std::size_t>();
+  if (!internal::is_valid_buffer_size(buffer.size())) {
+    return internal::too_large_size_promise<std::size_t>();
   }
   const auto* data = buffer.data();
   const auto size = buffer.size();
@@ -10358,7 +10358,7 @@ inline promise<std::size_t> write(
             user_data);
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
-        return detail::size_result(
+        return internal::size_result(
             g_output_stream_write_finish(
                 G_OUTPUT_STREAM(source_object), result, error),
             error,
@@ -10381,10 +10381,10 @@ inline promise<std::size_t> write_all(
     std::span<const std::byte> buffer,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (stream == nullptr) {
-    return detail::null_argument_promise<std::size_t>("stream");
+    return internal::null_argument_promise<std::size_t>("stream");
   }
-  if (!detail::is_valid_buffer_size(buffer.size())) {
-    return detail::too_large_size_promise<std::size_t>();
+  if (!internal::is_valid_buffer_size(buffer.size())) {
+    return internal::too_large_size_promise<std::size_t>();
   }
   const auto* data = buffer.data();
   const auto size = buffer.size();
@@ -10404,7 +10404,7 @@ inline promise<std::size_t> write_all(
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
         auto bytes_written = gsize{};
-        detail::ensure_boolean_result(
+        internal::ensure_boolean_result(
             g_output_stream_write_all_finish(
                 G_OUTPUT_STREAM(source_object), result, &bytes_written, error),
             error,
@@ -10426,7 +10426,7 @@ inline promise<std::size_t> write_bytes(
     GBytes* bytes,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (stream == nullptr || bytes == nullptr) {
-    return detail::null_argument_promise<std::size_t>("object");
+    return internal::null_argument_promise<std::size_t>("object");
   }
   return submit<std::size_t>(
       [stream, bytes, io_priority](
@@ -10437,7 +10437,7 @@ inline promise<std::size_t> write_bytes(
             stream, bytes, io_priority, cancellable, callback, user_data);
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
-        return detail::size_result(
+        return internal::size_result(
             g_output_stream_write_bytes_finish(
                 G_OUTPUT_STREAM(source_object), result, error),
             error,
@@ -10460,7 +10460,7 @@ inline promise<std::size_t> splice(
     GOutputStreamSpliceFlags flags,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (stream == nullptr || source == nullptr) {
-    return detail::null_argument_promise<std::size_t>("object");
+    return internal::null_argument_promise<std::size_t>("object");
   }
   return submit<std::size_t>(
       [stream, source, flags, io_priority](
@@ -10471,7 +10471,7 @@ inline promise<std::size_t> splice(
             stream, source, flags, io_priority, cancellable, callback, user_data);
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
-        return detail::size_result(
+        return internal::size_result(
             g_output_stream_splice_finish(
                 G_OUTPUT_STREAM(source_object), result, error),
             error,
@@ -10489,7 +10489,7 @@ inline promise<std::size_t> splice(
 inline promise<void> flush(
     GOutputStream* stream,
     int io_priority = G_PRIORITY_DEFAULT) {
-  return detail::submit_checked<void>(
+  return internal::submit_checked<void>(
       stream,
       [stream, io_priority](
           GCancellable* cancellable,
@@ -10499,7 +10499,7 @@ inline promise<void> flush(
             stream, io_priority, cancellable, callback, user_data);
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
-        detail::ensure_boolean_result(
+        internal::ensure_boolean_result(
             g_output_stream_flush_finish(
                 G_OUTPUT_STREAM(source_object), result, error),
             error,
@@ -10517,7 +10517,7 @@ inline promise<void> flush(
 inline promise<void> close(
     GOutputStream* stream,
     int io_priority = G_PRIORITY_DEFAULT) {
-  return detail::submit_checked<void>(
+  return internal::submit_checked<void>(
       stream,
       [stream, io_priority](
           GCancellable* cancellable,
@@ -10527,7 +10527,7 @@ inline promise<void> close(
             stream, io_priority, cancellable, callback, user_data);
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
-        detail::ensure_boolean_result(
+        internal::ensure_boolean_result(
             g_output_stream_close_finish(
                 G_OUTPUT_STREAM(source_object), result, error),
             error,
@@ -10550,7 +10550,7 @@ inline promise<void> splice(
     GIOStreamSpliceFlags flags,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (stream1 == nullptr || stream2 == nullptr) {
-    return detail::null_argument_promise<void>("stream");
+    return internal::null_argument_promise<void>("stream");
   }
   return submit<void>(
       [stream1, stream2, flags, io_priority](
@@ -10561,7 +10561,7 @@ inline promise<void> splice(
             stream1, stream2, flags, io_priority, cancellable, callback, user_data);
       },
       [](GObject*, GAsyncResult* result, GError** error) {
-        detail::ensure_boolean_result(
+        internal::ensure_boolean_result(
             g_io_stream_splice_finish(result, error),
             error,
             "cardio: g_io_stream_splice_finish failed");
@@ -10578,7 +10578,7 @@ inline promise<void> splice(
 inline promise<void> close(
     GIOStream* stream,
     int io_priority = G_PRIORITY_DEFAULT) {
-  return detail::submit_checked<void>(
+  return internal::submit_checked<void>(
       stream,
       [stream, io_priority](
           GCancellable* cancellable,
@@ -10588,7 +10588,7 @@ inline promise<void> close(
             stream, io_priority, cancellable, callback, user_data);
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
-        detail::ensure_boolean_result(
+        internal::ensure_boolean_result(
             g_io_stream_close_finish(G_IO_STREAM(source_object), result, error),
             error,
             "cardio: g_io_stream_close_finish failed");
@@ -10605,7 +10605,7 @@ inline promise<void> close(
 inline promise<GFileInputStream*> read(
     GFile* file,
     int io_priority = G_PRIORITY_DEFAULT) {
-  return detail::submit_checked<GFileInputStream*>(
+  return internal::submit_checked<GFileInputStream*>(
       file,
       [file, io_priority](
           GCancellable* cancellable,
@@ -10630,7 +10630,7 @@ inline promise<GFileOutputStream*> append_to(
     GFile* file,
     GFileCreateFlags flags,
     int io_priority = G_PRIORITY_DEFAULT) {
-  return detail::submit_checked<GFileOutputStream*>(
+  return internal::submit_checked<GFileOutputStream*>(
       file,
       [file, flags, io_priority](
           GCancellable* cancellable,
@@ -10656,7 +10656,7 @@ inline promise<GFileOutputStream*> create(
     GFile* file,
     GFileCreateFlags flags,
     int io_priority = G_PRIORITY_DEFAULT) {
-  return detail::submit_checked<GFileOutputStream*>(
+  return internal::submit_checked<GFileOutputStream*>(
       file,
       [file, flags, io_priority](
           GCancellable* cancellable,
@@ -10686,7 +10686,7 @@ inline promise<GFileOutputStream*> replace(
     bool make_backup,
     GFileCreateFlags flags,
     int io_priority = G_PRIORITY_DEFAULT) {
-  return detail::submit_checked<GFileOutputStream*>(
+  return internal::submit_checked<GFileOutputStream*>(
       file,
       [file, etag, make_backup, flags, io_priority](
           GCancellable* cancellable,
@@ -10717,7 +10717,7 @@ inline promise<GFileOutputStream*> replace(
 inline promise<GFileIOStream*> open_readwrite(
     GFile* file,
     int io_priority = G_PRIORITY_DEFAULT) {
-  return detail::submit_checked<GFileIOStream*>(
+  return internal::submit_checked<GFileIOStream*>(
       file,
       [file, io_priority](
           GCancellable* cancellable,
@@ -10743,7 +10743,7 @@ inline promise<GFileIOStream*> create_readwrite(
     GFile* file,
     GFileCreateFlags flags,
     int io_priority = G_PRIORITY_DEFAULT) {
-  return detail::submit_checked<GFileIOStream*>(
+  return internal::submit_checked<GFileIOStream*>(
       file,
       [file, flags, io_priority](
           GCancellable* cancellable,
@@ -10773,7 +10773,7 @@ inline promise<GFileIOStream*> replace_readwrite(
     bool make_backup,
     GFileCreateFlags flags,
     int io_priority = G_PRIORITY_DEFAULT) {
-  return detail::submit_checked<GFileIOStream*>(
+  return internal::submit_checked<GFileIOStream*>(
       file,
       [file, etag, make_backup, flags, io_priority](
           GCancellable* cancellable,
@@ -10810,9 +10810,9 @@ inline promise<GFileInfo*> query_info(
     GFileQueryInfoFlags flags,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (attributes == nullptr) {
-    return detail::null_argument_promise<GFileInfo*>("attributes");
+    return internal::null_argument_promise<GFileInfo*>("attributes");
   }
-  return detail::submit_checked<GFileInfo*>(
+  return internal::submit_checked<GFileInfo*>(
       file,
       [file, attributes, flags, io_priority](
           GCancellable* cancellable,
@@ -10845,9 +10845,9 @@ inline promise<GFileInfo*> query_filesystem_info(
     const char* attributes,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (attributes == nullptr) {
-    return detail::null_argument_promise<GFileInfo*>("attributes");
+    return internal::null_argument_promise<GFileInfo*>("attributes");
   }
-  return detail::submit_checked<GFileInfo*>(
+  return internal::submit_checked<GFileInfo*>(
       file,
       [file, attributes, io_priority](
           GCancellable* cancellable,
@@ -10877,9 +10877,9 @@ inline promise<GFileEnumerator*> enumerate_children(
     GFileQueryInfoFlags flags,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (attributes == nullptr) {
-    return detail::null_argument_promise<GFileEnumerator*>("attributes");
+    return internal::null_argument_promise<GFileEnumerator*>("attributes");
   }
-  return detail::submit_checked<GFileEnumerator*>(
+  return internal::submit_checked<GFileEnumerator*>(
       file,
       [file, attributes, flags, io_priority](
           GCancellable* cancellable,
@@ -10910,7 +10910,7 @@ inline promise<GFileEnumerator*> enumerate_children(
 inline promise<void> delete_file(
     GFile* file,
     int io_priority = G_PRIORITY_DEFAULT) {
-  return detail::submit_checked<void>(
+  return internal::submit_checked<void>(
       file,
       [file, io_priority](
           GCancellable* cancellable,
@@ -10919,7 +10919,7 @@ inline promise<void> delete_file(
         g_file_delete_async(file, io_priority, cancellable, callback, user_data);
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
-        detail::ensure_boolean_result(
+        internal::ensure_boolean_result(
             g_file_delete_finish(G_FILE(source_object), result, error),
             error,
             "cardio: g_file_delete_finish failed");
@@ -10936,7 +10936,7 @@ inline promise<void> delete_file(
 inline promise<void> trash(
     GFile* file,
     int io_priority = G_PRIORITY_DEFAULT) {
-  return detail::submit_checked<void>(
+  return internal::submit_checked<void>(
       file,
       [file, io_priority](
           GCancellable* cancellable,
@@ -10945,7 +10945,7 @@ inline promise<void> trash(
         g_file_trash_async(file, io_priority, cancellable, callback, user_data);
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
-        detail::ensure_boolean_result(
+        internal::ensure_boolean_result(
             g_file_trash_finish(G_FILE(source_object), result, error),
             error,
             "cardio: g_file_trash_finish failed");
@@ -10970,7 +10970,7 @@ inline promise<void> copy(
     GFileCopyFlags flags,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (source == nullptr || destination == nullptr) {
-    return detail::null_argument_promise<void>("file");
+    return internal::null_argument_promise<void>("file");
   }
   return submit<void>(
       [source, destination, flags, io_priority](
@@ -10989,7 +10989,7 @@ inline promise<void> copy(
             user_data);
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
-        detail::ensure_boolean_result(
+        internal::ensure_boolean_result(
             g_file_copy_finish(G_FILE(source_object), result, error),
             error,
             "cardio: g_file_copy_finish failed");
@@ -11006,7 +11006,7 @@ inline promise<void> copy(
 inline promise<void> make_directory(
     GFile* file,
     int io_priority = G_PRIORITY_DEFAULT) {
-  return detail::submit_checked<void>(
+  return internal::submit_checked<void>(
       file,
       [file, io_priority](
           GCancellable* cancellable,
@@ -11016,7 +11016,7 @@ inline promise<void> make_directory(
             file, io_priority, cancellable, callback, user_data);
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
-        detail::ensure_boolean_result(
+        internal::ensure_boolean_result(
             g_file_make_directory_finish(G_FILE(source_object), result, error),
             error,
             "cardio: g_file_make_directory_finish failed");
@@ -11030,7 +11030,7 @@ inline promise<void> make_directory(
  * @return Promise that resolves with copied file contents and etag.
  */
 inline promise<file_contents> load_contents(GFile* file) {
-  return detail::submit_checked<file_contents>(
+  return internal::submit_checked<file_contents>(
       file,
       [file](
           GCancellable* cancellable,
@@ -11045,7 +11045,7 @@ inline promise<file_contents> load_contents(GFile* file) {
         auto loaded = file_contents{};
         const auto succeeded = g_file_load_contents_finish(
             G_FILE(source_object), result, &contents, &length, &etag, error);
-        detail::ensure_boolean_result(
+        internal::ensure_boolean_result(
             succeeded, error, "cardio: g_file_load_contents_finish failed");
         if (!succeeded) {
           return loaded;
@@ -11080,10 +11080,10 @@ inline promise<std::string> replace_contents(
     bool make_backup,
     GFileCreateFlags flags) {
   if (file == nullptr) {
-    return detail::null_argument_promise<std::string>("file");
+    return internal::null_argument_promise<std::string>("file");
   }
-  if (!detail::is_valid_buffer_size(contents.size())) {
-    return detail::too_large_size_promise<std::string>();
+  if (!internal::is_valid_buffer_size(contents.size())) {
+    return internal::too_large_size_promise<std::string>();
   }
   const auto* data = reinterpret_cast<const char*>(contents.data());
   const auto size = contents.size();
@@ -11107,7 +11107,7 @@ inline promise<std::string> replace_contents(
         auto* new_etag = static_cast<char*>(nullptr);
         const auto succeeded = g_file_replace_contents_finish(
             G_FILE(source_object), result, &new_etag, error);
-        detail::ensure_boolean_result(
+        internal::ensure_boolean_result(
             succeeded, error, "cardio: g_file_replace_contents_finish failed");
         auto etag_result = std::string{};
         if (succeeded && new_etag != nullptr) {
@@ -11135,7 +11135,7 @@ inline promise<std::string> replace_contents_bytes(
     bool make_backup,
     GFileCreateFlags flags) {
   if (file == nullptr || contents == nullptr) {
-    return detail::null_argument_promise<std::string>("object");
+    return internal::null_argument_promise<std::string>("object");
   }
   return submit<std::string>(
       [file, contents, etag, make_backup, flags](
@@ -11156,7 +11156,7 @@ inline promise<std::string> replace_contents_bytes(
         auto* new_etag = static_cast<char*>(nullptr);
         const auto succeeded = g_file_replace_contents_finish(
             G_FILE(source_object), result, &new_etag, error);
-        detail::ensure_boolean_result(
+        internal::ensure_boolean_result(
             succeeded, error, "cardio: g_file_replace_contents_finish failed");
         auto etag_result = std::string{};
         if (succeeded && new_etag != nullptr) {
@@ -11184,7 +11184,7 @@ inline promise<GList*> next_files(
     int count,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (enumerator == nullptr) {
-    return detail::null_argument_promise<GList*>("enumerator");
+    return internal::null_argument_promise<GList*>("enumerator");
   }
   return submit<GList*>(
       [enumerator, count, io_priority](
@@ -11210,7 +11210,7 @@ inline promise<GList*> next_files(
 inline promise<void> close(
     GFileEnumerator* enumerator,
     int io_priority = G_PRIORITY_DEFAULT) {
-  return detail::submit_checked<void>(
+  return internal::submit_checked<void>(
       enumerator,
       [enumerator, io_priority](
           GCancellable* cancellable,
@@ -11220,7 +11220,7 @@ inline promise<void> close(
             enumerator, io_priority, cancellable, callback, user_data);
       },
       [](GObject* source_object, GAsyncResult* result, GError** error) {
-        detail::ensure_boolean_result(
+        internal::ensure_boolean_result(
             g_file_enumerator_close_finish(
                 G_FILE_ENUMERATOR(source_object), result, error),
             error,
@@ -11241,9 +11241,9 @@ inline promise<GFileInfo*> query_info(
     const char* attributes,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (attributes == nullptr) {
-    return detail::null_argument_promise<GFileInfo*>("attributes");
+    return internal::null_argument_promise<GFileInfo*>("attributes");
   }
-  return detail::submit_checked<GFileInfo*>(
+  return internal::submit_checked<GFileInfo*>(
       stream,
       [stream, attributes, io_priority](
           GCancellable* cancellable,
@@ -11271,9 +11271,9 @@ inline promise<GFileInfo*> query_info(
     const char* attributes,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (attributes == nullptr) {
-    return detail::null_argument_promise<GFileInfo*>("attributes");
+    return internal::null_argument_promise<GFileInfo*>("attributes");
   }
-  return detail::submit_checked<GFileInfo*>(
+  return internal::submit_checked<GFileInfo*>(
       stream,
       [stream, attributes, io_priority](
           GCancellable* cancellable,
@@ -11301,9 +11301,9 @@ inline promise<GFileInfo*> query_info(
     const char* attributes,
     int io_priority = G_PRIORITY_DEFAULT) {
   if (attributes == nullptr) {
-    return detail::null_argument_promise<GFileInfo*>("attributes");
+    return internal::null_argument_promise<GFileInfo*>("attributes");
   }
-  return detail::submit_checked<GFileInfo*>(
+  return internal::submit_checked<GFileInfo*>(
       stream,
       [stream, attributes, io_priority](
           GCancellable* cancellable,
@@ -12743,7 +12743,7 @@ enum class reader_writer_lock_policy {
   write_preferring
 };
 
-namespace detail {
+namespace internal {
 
 template <typename Waiter>
 inline bool erase_waiter(
@@ -12778,7 +12778,7 @@ inline void release_mutex(const std::shared_ptr<mutex_state>& state);
 inline lock_handle make_mutex_handle(
     const std::shared_ptr<mutex_state>& state) {
   return lock_handle([state] {
-    detail::release_mutex(state);
+    internal::release_mutex(state);
   });
 }
 
@@ -12875,7 +12875,7 @@ inline void release_semaphore(const std::shared_ptr<semaphore_state>& state);
 inline lock_handle make_semaphore_handle(
     const std::shared_ptr<semaphore_state>& state) {
   return lock_handle([state] {
-    detail::release_semaphore(state);
+    internal::release_semaphore(state);
   });
 }
 
@@ -12978,14 +12978,14 @@ inline void release_writer_lock(
 inline lock_handle make_reader_handle(
     const std::shared_ptr<reader_writer_state>& state) {
   return lock_handle([state] {
-    detail::release_reader_lock(state);
+    internal::release_reader_lock(state);
   });
 }
 
 inline lock_handle make_writer_handle(
     const std::shared_ptr<reader_writer_state>& state) {
   return lock_handle([state] {
-    detail::release_writer_lock(state);
+    internal::release_writer_lock(state);
   });
 }
 
@@ -13188,15 +13188,15 @@ inline void cancel_conditional_waiter(
 }
 #endif
 
-}  // namespace detail
+}  // namespace internal
 
 /**
  * Promise-based mutual exclusion primitive.
  */
 class mutex {
 private:
-  std::shared_ptr<detail::mutex_state> state_ =
-      std::make_shared<detail::mutex_state>();
+  std::shared_ptr<internal::mutex_state> state_ =
+      std::make_shared<internal::mutex_state>();
 
 public:
   /**
@@ -13206,15 +13206,15 @@ public:
    */
   inline promise<lock_handle> lock() {
     auto state = state_;
-    auto waiter = std::shared_ptr<detail::mutex_waiter>{};
+    auto waiter = std::shared_ptr<internal::mutex_waiter>{};
     {
       auto lock = std::lock_guard<std::mutex>(state->mutex);
       if (!state->locked) {
         state->locked = true;
-        return resolved(detail::make_mutex_handle(state));
+        return resolved(internal::make_mutex_handle(state));
       }
 
-      waiter = std::make_shared<detail::mutex_waiter>();
+      waiter = std::make_shared<internal::mutex_waiter>();
       state->waiters.push_back(waiter);
     }
 
@@ -13234,23 +13234,23 @@ public:
     }
 
     auto state = state_;
-    auto waiter = std::shared_ptr<detail::mutex_waiter>{};
+    auto waiter = std::shared_ptr<internal::mutex_waiter>{};
     {
       auto lock = std::lock_guard<std::mutex>(state->mutex);
       if (!state->locked) {
         state->locked = true;
-        return resolved(detail::make_mutex_handle(state));
+        return resolved(internal::make_mutex_handle(state));
       }
 
-      waiter = std::make_shared<detail::mutex_waiter>();
+      waiter = std::make_shared<internal::mutex_waiter>();
       state->waiters.push_back(waiter);
     }
 
     waiter->registration =
         cancellation_signal.on_cancellation_requested([
-            weak_state = std::weak_ptr<detail::mutex_state>(state),
-            weak_waiter = std::weak_ptr<detail::mutex_waiter>(waiter)] {
-          detail::cancel_mutex_waiter(
+            weak_state = std::weak_ptr<internal::mutex_state>(state),
+            weak_waiter = std::weak_ptr<internal::mutex_waiter>(waiter)] {
+          internal::cancel_mutex_waiter(
               std::move(weak_state), std::move(weak_waiter));
         });
     return waiter->source.get_promise();
@@ -13283,8 +13283,8 @@ public:
  */
 class semaphore {
 private:
-  std::shared_ptr<detail::semaphore_state> state_ =
-      std::make_shared<detail::semaphore_state>();
+  std::shared_ptr<internal::semaphore_state> state_ =
+      std::make_shared<internal::semaphore_state>();
 
 public:
   /**
@@ -13312,15 +13312,15 @@ public:
    */
   inline promise<lock_handle> acquire() {
     auto state = state_;
-    auto waiter = std::shared_ptr<detail::semaphore_waiter>{};
+    auto waiter = std::shared_ptr<internal::semaphore_waiter>{};
     {
       auto lock = std::lock_guard<std::mutex>(state->mutex);
       if (state->available > 0) {
         --state->available;
-        return resolved(detail::make_semaphore_handle(state));
+        return resolved(internal::make_semaphore_handle(state));
       }
 
-      waiter = std::make_shared<detail::semaphore_waiter>();
+      waiter = std::make_shared<internal::semaphore_waiter>();
       state->waiters.push_back(waiter);
     }
 
@@ -13340,24 +13340,24 @@ public:
     }
 
     auto state = state_;
-    auto waiter = std::shared_ptr<detail::semaphore_waiter>{};
+    auto waiter = std::shared_ptr<internal::semaphore_waiter>{};
     {
       auto lock = std::lock_guard<std::mutex>(state->mutex);
       if (state->available > 0) {
         --state->available;
-        return resolved(detail::make_semaphore_handle(state));
+        return resolved(internal::make_semaphore_handle(state));
       }
 
-      waiter = std::make_shared<detail::semaphore_waiter>();
+      waiter = std::make_shared<internal::semaphore_waiter>();
       state->waiters.push_back(waiter);
     }
 
     waiter->registration =
         cancellation_signal.on_cancellation_requested([
-            weak_state = std::weak_ptr<detail::semaphore_state>(state),
+            weak_state = std::weak_ptr<internal::semaphore_state>(state),
             weak_waiter =
-                std::weak_ptr<detail::semaphore_waiter>(waiter)] {
-          detail::cancel_semaphore_waiter(
+                std::weak_ptr<internal::semaphore_waiter>(waiter)] {
+          internal::cancel_semaphore_waiter(
               std::move(weak_state), std::move(weak_waiter));
         });
     return waiter->source.get_promise();
@@ -13390,7 +13390,7 @@ public:
  */
 class reader_writer_lock {
 private:
-  std::shared_ptr<detail::reader_writer_state> state_;
+  std::shared_ptr<internal::reader_writer_state> state_;
 
   inline bool can_read_immediately() const {
     if (state_->policy == reader_writer_lock_policy::read_preferring) {
@@ -13409,7 +13409,7 @@ public:
   inline explicit reader_writer_lock(
       reader_writer_lock_policy policy =
           reader_writer_lock_policy::write_preferring)
-      : state_(std::make_shared<detail::reader_writer_state>(policy)) {
+      : state_(std::make_shared<internal::reader_writer_state>(policy)) {
   }
 
   /**
@@ -13419,15 +13419,15 @@ public:
    */
   inline promise<lock_handle> read_lock() {
     auto state = state_;
-    auto waiter = std::shared_ptr<detail::reader_writer_waiter>{};
+    auto waiter = std::shared_ptr<internal::reader_writer_waiter>{};
     {
       auto lock = std::lock_guard<std::mutex>(state->mutex);
       if (can_read_immediately()) {
         ++state->current_readers;
-        return resolved(detail::make_reader_handle(state));
+        return resolved(internal::make_reader_handle(state));
       }
 
-      waiter = std::make_shared<detail::reader_writer_waiter>();
+      waiter = std::make_shared<internal::reader_writer_waiter>();
       state->read_waiters.push_back(waiter);
     }
 
@@ -13447,24 +13447,24 @@ public:
     }
 
     auto state = state_;
-    auto waiter = std::shared_ptr<detail::reader_writer_waiter>{};
+    auto waiter = std::shared_ptr<internal::reader_writer_waiter>{};
     {
       auto lock = std::lock_guard<std::mutex>(state->mutex);
       if (can_read_immediately()) {
         ++state->current_readers;
-        return resolved(detail::make_reader_handle(state));
+        return resolved(internal::make_reader_handle(state));
       }
 
-      waiter = std::make_shared<detail::reader_writer_waiter>();
+      waiter = std::make_shared<internal::reader_writer_waiter>();
       state->read_waiters.push_back(waiter);
     }
 
     waiter->registration =
         cancellation_signal.on_cancellation_requested([
-            weak_state = std::weak_ptr<detail::reader_writer_state>(state),
+            weak_state = std::weak_ptr<internal::reader_writer_state>(state),
             weak_waiter =
-                std::weak_ptr<detail::reader_writer_waiter>(waiter)] {
-          detail::cancel_reader_writer_waiter(
+                std::weak_ptr<internal::reader_writer_waiter>(waiter)] {
+          internal::cancel_reader_writer_waiter(
               std::move(weak_state), std::move(weak_waiter), true);
         });
     return waiter->source.get_promise();
@@ -13478,15 +13478,15 @@ public:
    */
   inline promise<lock_handle> write_lock() {
     auto state = state_;
-    auto waiter = std::shared_ptr<detail::reader_writer_waiter>{};
+    auto waiter = std::shared_ptr<internal::reader_writer_waiter>{};
     {
       auto lock = std::lock_guard<std::mutex>(state->mutex);
       if (!state->has_writer && state->current_readers == 0) {
         state->has_writer = true;
-        return resolved(detail::make_writer_handle(state));
+        return resolved(internal::make_writer_handle(state));
       }
 
-      waiter = std::make_shared<detail::reader_writer_waiter>();
+      waiter = std::make_shared<internal::reader_writer_waiter>();
       state->write_waiters.push_back(waiter);
     }
 
@@ -13506,24 +13506,24 @@ public:
     }
 
     auto state = state_;
-    auto waiter = std::shared_ptr<detail::reader_writer_waiter>{};
+    auto waiter = std::shared_ptr<internal::reader_writer_waiter>{};
     {
       auto lock = std::lock_guard<std::mutex>(state->mutex);
       if (!state->has_writer && state->current_readers == 0) {
         state->has_writer = true;
-        return resolved(detail::make_writer_handle(state));
+        return resolved(internal::make_writer_handle(state));
       }
 
-      waiter = std::make_shared<detail::reader_writer_waiter>();
+      waiter = std::make_shared<internal::reader_writer_waiter>();
       state->write_waiters.push_back(waiter);
     }
 
     waiter->registration =
         cancellation_signal.on_cancellation_requested([
-            weak_state = std::weak_ptr<detail::reader_writer_state>(state),
+            weak_state = std::weak_ptr<internal::reader_writer_state>(state),
             weak_waiter =
-                std::weak_ptr<detail::reader_writer_waiter>(waiter)] {
-          detail::cancel_reader_writer_waiter(
+                std::weak_ptr<internal::reader_writer_waiter>(waiter)] {
+          internal::cancel_reader_writer_waiter(
               std::move(weak_state), std::move(weak_waiter), false);
         });
     return waiter->source.get_promise();
@@ -13576,20 +13576,20 @@ public:
  */
 class conditional {
 private:
-  std::shared_ptr<detail::conditional_state> state_ =
-      std::make_shared<detail::conditional_state>();
+  std::shared_ptr<internal::conditional_state> state_ =
+      std::make_shared<internal::conditional_state>();
 
 protected:
   inline explicit conditional(bool raised)
-      : state_(std::make_shared<detail::conditional_state>()) {
+      : state_(std::make_shared<internal::conditional_state>()) {
     state_->raised = raised;
   }
 
   inline promise<void> wait_when_not_raised() {
-    auto waiter = std::shared_ptr<detail::conditional_waiter>{};
+    auto waiter = std::shared_ptr<internal::conditional_waiter>{};
     {
       auto lock = std::lock_guard<std::mutex>(state_->mutex);
-      waiter = std::make_shared<detail::conditional_waiter>();
+      waiter = std::make_shared<internal::conditional_waiter>();
       state_->waiters.push_back(waiter);
     }
 
@@ -13603,26 +13603,26 @@ protected:
       return rejected(canceled_exception());
     }
 
-    auto waiter = std::shared_ptr<detail::conditional_waiter>{};
+    auto waiter = std::shared_ptr<internal::conditional_waiter>{};
     {
       auto lock = std::lock_guard<std::mutex>(state_->mutex);
-      waiter = std::make_shared<detail::conditional_waiter>();
+      waiter = std::make_shared<internal::conditional_waiter>();
       state_->waiters.push_back(waiter);
     }
 
     waiter->registration =
         cancellation_signal.on_cancellation_requested([
-            weak_state = std::weak_ptr<detail::conditional_state>(state_),
+            weak_state = std::weak_ptr<internal::conditional_state>(state_),
             weak_waiter =
-                std::weak_ptr<detail::conditional_waiter>(waiter)] {
-          detail::cancel_conditional_waiter(
+                std::weak_ptr<internal::conditional_waiter>(waiter)] {
+          internal::cancel_conditional_waiter(
               std::move(weak_state), std::move(weak_waiter));
         });
     return waiter->source.get_promise();
   }
 #endif
 
-  inline std::shared_ptr<detail::conditional_state> state() const noexcept {
+  inline std::shared_ptr<internal::conditional_state> state() const noexcept {
     return state_;
   }
 
@@ -13660,14 +13660,14 @@ public:
    * If no waiter is pending, the trigger is dropped.
    */
   inline void trigger() {
-    auto waiter = std::shared_ptr<detail::conditional_waiter>{};
+    auto waiter = std::shared_ptr<internal::conditional_waiter>{};
     {
       auto lock = std::lock_guard<std::mutex>(state_->mutex);
-      waiter = detail::pop_conditional_waiter(*state_);
+      waiter = internal::pop_conditional_waiter(*state_);
     }
 
     if (waiter) {
-      detail::complete_conditional_waiter(waiter);
+      internal::complete_conditional_waiter(waiter);
     }
   }
 };
@@ -13726,15 +13726,15 @@ public:
    * Releases one pending waiter and drops the raised state.
    */
   inline void trigger() {
-    auto waiter = std::shared_ptr<detail::conditional_waiter>{};
+    auto waiter = std::shared_ptr<internal::conditional_waiter>{};
     {
       auto lock = std::lock_guard<std::mutex>(state()->mutex);
       state()->raised = false;
-      waiter = detail::pop_conditional_waiter(*state());
+      waiter = internal::pop_conditional_waiter(*state());
     }
 
     if (waiter) {
-      detail::complete_conditional_waiter(waiter);
+      internal::complete_conditional_waiter(waiter);
     }
   }
 
@@ -13742,17 +13742,17 @@ public:
    * Raises the condition and releases all pending waiters.
    */
   inline void raise() {
-    auto waiters = std::vector<std::shared_ptr<detail::conditional_waiter>>{};
+    auto waiters = std::vector<std::shared_ptr<internal::conditional_waiter>>{};
     {
       auto lock = std::lock_guard<std::mutex>(state()->mutex);
       state()->raised = true;
-      while (auto waiter = detail::pop_conditional_waiter(*state())) {
+      while (auto waiter = internal::pop_conditional_waiter(*state())) {
         waiters.push_back(std::move(waiter));
       }
     }
 
     for (auto& waiter : waiters) {
-      detail::complete_conditional_waiter(waiter);
+      internal::complete_conditional_waiter(waiter);
     }
   }
 
