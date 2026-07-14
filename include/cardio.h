@@ -149,7 +149,7 @@
 #include <utility>
 #include <vector>
 
-#if CARDIO_HAS_NATIVE_WAIT
+#if CARDIO_HAS_NATIVE_WAIT || CARDIO_WITH_SUPPLEMENTAL
 #include <thread>
 #endif
 
@@ -12111,6 +12111,151 @@ namespace io_urings {
 
 namespace promises {
 
+namespace internal {
+
+template <typename T> struct start_new_return_traits {
+  using result_type = T;
+  static constexpr bool returns_promise = false;
+};
+
+template <typename T> struct start_new_return_traits<promise<T>> {
+  using result_type = T;
+  static constexpr bool returns_promise = true;
+};
+
+template <typename T> struct start_new_state {
+  promise_source<T> source;
+};
+
+template <typename T>
+inline void start_new_complete_rejected(
+    const std::shared_ptr<start_new_state<T>>& state) {
+#if CARDIO_HAS_EXCEPTIONS
+  try {
+    throw;
+  } catch (const canceled_exception&) {
+    (void)state->source.try_cancel();
+  } catch (...) {
+    (void)state->source.try_reject(std::current_exception());
+  }
+#else
+  (void)state;
+#endif
+}
+
+template <typename T>
+inline promise<void> start_new_watch_async(
+    std::shared_ptr<start_new_state<T>> state,
+    promise<T> target) {
+#if CARDIO_HAS_EXCEPTIONS
+  try {
+#endif
+    if constexpr (std::is_void_v<T>) {
+      co_await target;
+      (void)state->source.try_resolve();
+    } else {
+      co_await target;
+      (void)state->source.try_resolve(
+          std::move(target).unsafe_result());
+    }
+#if CARDIO_HAS_EXCEPTIONS
+  } catch (...) {
+    start_new_complete_rejected(state);
+  }
+#endif
+}
+
+template <typename T, typename Function>
+inline void start_new_run_body(
+    const std::shared_ptr<start_new_state<T>>& state,
+    dispatcher_host& dispatcher,
+    Function& function) {
+  using return_type = std::invoke_result_t<Function&>;
+  using traits =
+      start_new_return_traits<std::decay_t<return_type>>;
+
+  if constexpr (traits::returns_promise) {
+    auto target = std::invoke(function);
+    auto watcher = start_new_watch_async(state, std::move(target));
+    (void)watcher;
+    dispatcher.park();
+  } else if constexpr (std::is_void_v<return_type>) {
+    std::invoke(function);
+    (void)state->source.try_resolve();
+  } else {
+    auto value = std::invoke(function);
+    (void)state->source.try_resolve(std::move(value));
+  }
+}
+
+template <typename T, typename Function>
+inline void start_new_worker(
+    std::shared_ptr<start_new_state<T>> state,
+    Function function) {
+#if CARDIO_HAS_EXCEPTIONS
+  try {
+#endif
+    dispatcher_host dispatcher;
+    set_current_dispatcher(&dispatcher);
+    start_new_run_body(state, dispatcher, function);
+#if CARDIO_HAS_EXCEPTIONS
+  } catch (...) {
+    start_new_complete_rejected(state);
+  }
+#endif
+}
+
+}  // namespace internal
+
+/**
+ * Runs a callable on a newly created worker thread.
+ *
+ * @tparam Function Callable object type.
+ * @param function Callable to run on the worker thread.
+ * @return Promise resolved from the callable result.
+ *
+ * @remarks
+ * This helper creates a worker thread for each call and installs an independent
+ * dispatcher_host on that thread. If the callable returns cardio::promise<T>,
+ * the worker dispatcher is parked until that promise completes, and the
+ * returned promise resolves with T. The current thread must already have a
+ * dispatcher because the returned promise belongs to the current dispatcher.
+ *
+ * Cancellation is cooperative: capture a cardio::cancellation in the callable
+ * and pass it to cancellable operations or, when exception support is enabled,
+ * call throw_if_cancellation_requested(). The caller dispatcher must outlive
+ * the returned promise and the worker completion that resolves it.
+ */
+template <typename Function>
+inline auto start_new(Function&& function) {
+  using function_type = std::decay_t<Function>;
+  using return_type = std::invoke_result_t<function_type&>;
+  using traits =
+      internal::start_new_return_traits<std::decay_t<return_type>>;
+  using result_type = typename traits::result_type;
+
+  auto state =
+      std::make_shared<internal::start_new_state<result_type>>();
+  auto result = state->source.get_promise();
+
+#if CARDIO_HAS_EXCEPTIONS
+  try {
+#endif
+    auto worker = std::thread(
+        [state,
+         function = function_type(std::forward<Function>(function))]() mutable {
+          internal::start_new_worker(state, std::move(function));
+        });
+    worker.detach();
+#if CARDIO_HAS_EXCEPTIONS
+  } catch (...) {
+    internal::start_new_complete_rejected(state);
+  }
+#endif
+
+  return result;
+}
+
 /**
  * Creates a promise that resolves after a delay.
  *
@@ -12126,8 +12271,8 @@ inline promise<void> delay(std::uint64_t msec) {
     return resolved();
   }
 
-  return internal::delay_until_impl(
-      internal::deadline_after_milliseconds(msec));
+  return ::cardio::internal::delay_until_impl(
+      ::cardio::internal::deadline_after_milliseconds(msec));
 }
 
 }  // namespace promises
@@ -12187,8 +12332,8 @@ inline promise<void> delay(
     return resolved();
   }
 
-  return internal::delay_until_impl(
-      internal::deadline_after_milliseconds(msec),
+  return ::cardio::internal::delay_until_impl(
+      ::cardio::internal::deadline_after_milliseconds(msec),
       std::move(cancellation_signal));
 }
 #endif
