@@ -288,6 +288,19 @@ static void helper_all_resolves_without_exceptions() {
   CHECK_EQ(values[1], 3);
 }
 
+static void start_new_resolves_without_exceptions() {
+  test_dispatcher_host dispatcher;
+
+  auto promise = cardio::promises::start_new([] {
+    return 55;
+  });
+
+  dispatcher.park();
+
+  CHECK(promise.is_ready());
+  CHECK_EQ(promise.unsafe_result(), 55);
+}
+
 static void primitives_resolve_without_exceptions() {
   test_dispatcher_host dispatcher;
   cardio::primitives::mutex locker;
@@ -426,6 +439,7 @@ int main() {
   cancellation_source_notifies_without_exceptions();
   supplemental_delay_resolves_without_exceptions();
   helper_all_resolves_without_exceptions();
+  start_new_resolves_without_exceptions();
   primitives_resolve_without_exceptions();
   helper_timeout_cancels_without_exceptions();
   cancellations_any_combines_without_exceptions();

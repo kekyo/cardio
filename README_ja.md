@@ -1109,6 +1109,7 @@ Win32の補助関数は `CARDIO_HAS_WIN32_HANDLE=1` が定義されている場�
 |:----|:----|
 |`promises::delay()`|指定された時間(msec)待機するpromiseを返します|
 |`promises::all()`|JavaScriptの`Promise.all()`と同様に、すべての入力promiseが完了したときに完了するpromiseを返します|
+|`promises::start_new()`|新しいワーカースレッドでcallableを実行し、その結果を表すpromiseを返します|
 |`cancellations::timeout()`|JavaScriptの`AbortSignal.timeout()`と同様に、指定された時間(msec)後にキャンセル要求する`cancellation_source`を返します|
 |`cancellations::any()`|JavaScriptの`AbortSignal.any()`と同様に、入力`cancellation`のいずれかがキャンセルされたときにキャンセル要求する`cancellation_source`を返します|
 |`io_urings::submit()`|io_uringの単発operationを直接投入し、完了フィールドを返します|
@@ -1158,6 +1159,47 @@ static cardio::promise<void> update_async(
 時間経過は dispatcher が `park()` されている間に検出されます。
 `cancellations::timeout()` が返す `cancellation_source` は、dispatcher が期限切れ timer を処理した時点でキャンセル状態になり、
 登録済みのコールバックは登録時の dispatcher にキューイングされます。
+
+### ワーカースレッドで処理を開始する
+
+`promises::start_new()` は、1つのcallableに対して新しいワーカースレッドを生成し、
+呼び出し元の現在のdispatcherに属するpromiseを返します。
+ブロッキング処理やCPU負荷の高い処理を、cardioのcore dispatcher実装に含めずに実行したい場合に使用できます。
+
+```cpp
+static cardio::promise<int> worker_async() {
+  co_await cardio::promises::delay(10);
+  co_return 42;
+}
+
+int main() {
+  cardio::dispatcher_host d;
+
+  auto result = cardio::promises::start_new([] {
+    return worker_async();
+  });
+
+  d.park();
+
+  printf("result = %d\n", result.unsafe_result());
+  return 0;
+}
+```
+
+callableは、値、`void`、`promise<T>`、`promise<void>` を返すことができます。
+promiseを返した場合、`start_new()` はワーカースレッド上に独立したdispatcherを設定し、
+そのpromiseが完了するまでworker dispatcherを `park()` します。
+`start_new()` は呼び出しごとに1つのスレッドを生成し、スレッドプールは使用しません。
+
+キャンセルは協調的に処理します。callableに `cardio::cancellation` をcaptureし、
+キャンセル対応operationへ渡すか、自分の処理の中で能動的に確認してください。
+結果が不要な場合は、返されたpromiseを `fire_and_forget()` で完了まで生存させることもできます:
+
+```cpp
+cardio::fire_and_forget(cardio::promises::start_new([] {
+  return worker_async();
+}));
+```
 
 ---
 
