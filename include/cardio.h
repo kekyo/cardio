@@ -4583,20 +4583,45 @@ private:
     glib_wait_snapshot_valid_ = false;
   }
 
+  inline bool glib_poll_fds_match(
+      const wait_snapshot& snapshot) const noexcept {
+    if (glib_poll_fds_.size() != snapshot.poll_fds.size()) {
+      return false;
+    }
+    for (auto index = std::size_t{0};
+         index < glib_poll_fds_.size(); ++index) {
+      const auto expected = to_glib_poll_fd(snapshot.poll_fds[index]);
+      if (glib_poll_fds_[index].fd != expected.fd ||
+          glib_poll_fds_[index].events != expected.events) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   inline void install_glib_wait_snapshot(wait_snapshot snapshot) {
-    clear_glib_poll_fds();
     if (snapshot.empty()) {
+      clear_glib_poll_fds();
       return;
+    }
+
+    // Replacing poll registrations wakes an attached GMainContext. Preserve
+    // stable registrations so an unchanged fd wait can remain blocked.
+    if (!glib_poll_fds_match(snapshot)) {
+      clear_glib_poll_fds();
+      glib_poll_fds_.reserve(snapshot.poll_fds.size());
+      for (const auto& fd : snapshot.poll_fds) {
+        glib_poll_fds_.push_back(to_glib_poll_fd(fd));
+      }
+      for (auto& fd : glib_poll_fds_) {
+        g_source_add_poll(source_, &fd);
+      }
     }
 
     glib_wait_snapshot_ = std::move(snapshot);
     glib_wait_snapshot_valid_ = true;
-    glib_poll_fds_.reserve(glib_wait_snapshot_.poll_fds.size());
-    for (const auto& fd : glib_wait_snapshot_.poll_fds) {
-      glib_poll_fds_.push_back(to_glib_poll_fd(fd));
-    }
     for (auto& fd : glib_poll_fds_) {
-      g_source_add_poll(source_, &fd);
+      fd.revents = 0;
     }
   }
 

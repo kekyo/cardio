@@ -73,6 +73,65 @@ static void write_byte(int fd) {
   CHECK_EQ(::write(fd, &value, 1), 1);
 }
 
+struct glib_poll_probe_state {
+  int read_fd;
+  int write_fd;
+  GPollFunc delegate;
+  unsigned int self_wake_count = 0;
+  bool observed_quiet_wait = false;
+  bool data_written = false;
+};
+
+static glib_poll_probe_state* active_glib_poll_probe = nullptr;
+
+static gint probe_glib_poll(GPollFD* fds, guint fd_count, gint timeout) {
+  auto* probe = active_glib_poll_probe;
+  if (probe == nullptr) {
+    return g_poll(fds, fd_count, timeout);
+  }
+
+  auto monitors_target = false;
+  for (auto index = guint{0}; index < fd_count; ++index) {
+    if (fds[index].fd == probe->read_fd) {
+      monitors_target = true;
+      break;
+    }
+  }
+  if (!monitors_target) {
+    return probe->delegate(fds, fd_count, timeout);
+  }
+
+  // A zero-time probe deterministically distinguishes an internal self-wakeup
+  // from the quiet wait that would otherwise block for the target fd.
+  const auto result = probe->delegate(fds, fd_count, 0);
+  auto target_ready = false;
+  for (auto index = guint{0}; index < fd_count; ++index) {
+    if (fds[index].fd == probe->read_fd &&
+        (fds[index].revents & G_IO_IN) != 0) {
+      target_ready = true;
+      break;
+    }
+  }
+  if (target_ready) {
+    return result;
+  }
+
+  if (result == 0) {
+    probe->observed_quiet_wait = true;
+    write_byte(probe->write_fd);
+    probe->data_written = true;
+    return probe->delegate(fds, fd_count, 0);
+  }
+
+  ++probe->self_wake_count;
+  if (probe->self_wake_count >= 4 && !probe->data_written) {
+    // Bound the regression path so a broken dispatcher fails without hanging.
+    write_byte(probe->write_fd);
+    probe->data_written = true;
+  }
+  return result;
+}
+
 static GMainContext* new_test_context() {
   return g_main_context_new();
 }
@@ -599,6 +658,47 @@ static void external_loop_can_resume_fd_wait() {
   g_main_loop_unref(loop);
 }
 
+static void external_loop_fd_wait_does_not_self_wake() {
+  auto* context = new_test_context();
+  cardio::dispatcher_group_glib group(context);
+  g_main_context_unref(context);
+  cardio::dispatcher_host_glib_auto dispatcher(group);
+  auto* loop = g_main_loop_new(group.context(), FALSE);
+  int fds[2]{-1, -1};
+  make_pipe(fds);
+
+  cardio::set_current_dispatcher(nullptr);
+  auto result = cardio::fd_event::none;
+  auto completed = false;
+  auto promise = std::optional<cardio::promise<void>>{};
+  auto probe = glib_poll_probe_state{
+      .read_fd = fds[0],
+      .write_fd = fds[1],
+      .delegate = g_main_context_get_poll_func(group.context()),
+  };
+  active_glib_poll_probe = &probe;
+  g_main_context_set_poll_func(group.context(), probe_glib_poll);
+
+  cardio::internal::dangerous_schedule_later__(&dispatcher, [&] {
+    promise.emplace(
+        wait_for_read_and_quit_async(fds[0], result, completed, loop));
+  });
+
+  g_main_loop_run(loop);
+
+  g_main_context_set_poll_func(group.context(), probe.delegate);
+  active_glib_poll_probe = nullptr;
+  CHECK(completed);
+  CHECK(promise.has_value());
+  CHECK(promise->is_ready());
+  CHECK((result & cardio::fd_event::read) != cardio::fd_event::none);
+  CHECK(probe.observed_quiet_wait);
+
+  close_fd(fds[0]);
+  close_fd(fds[1]);
+  g_main_loop_unref(loop);
+}
+
 //-----------------------------------------------------------------------------------------------
 
 static void immediate_shutdown_skips_pending_dispatcher_work() {
@@ -763,6 +863,7 @@ int main() {
   switch_to_roundtrips_between_glib_and_regular_dispatchers();
   external_loop_can_resume_delay();
   external_loop_can_resume_fd_wait();
+  external_loop_fd_wait_does_not_self_wake();
   immediate_shutdown_skips_pending_dispatcher_work();
   immediate_shutdown_from_thread_skips_pending_fd_wait();
   gentle_shutdown_collects_ready_fd_wait();
