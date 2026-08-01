@@ -225,6 +225,21 @@ static void fire_and_forget_keeps_start_new_promise_alive() {
   CHECK(completed.load(std::memory_order_acquire));
 }
 
+static void worker_can_finish_after_caller_dispatcher_is_destroyed() {
+  auto completed = std::atomic<bool>{false};
+
+  {
+    test_dispatcher_host dispatcher;
+    auto promise = cardio::promises::start_new([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      completed.store(true, std::memory_order_release);
+    });
+    (void)promise;
+  }
+
+  wait_until_true(completed);
+}
+
 //-----------------------------------------------------------------------------------------------
 
 int main() {
@@ -239,6 +254,7 @@ int main() {
   parent_cancellation_cancels_worker_async_operation();
 #endif
   fire_and_forget_keeps_start_new_promise_alive();
+  worker_can_finish_after_caller_dispatcher_is_destroyed();
 
   std::puts("cardio_start_new_test: PASS");
   return 0;

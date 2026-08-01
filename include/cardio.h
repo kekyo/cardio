@@ -201,6 +201,7 @@ class dispatcher_host_glib_auto;
 namespace internal {
   struct cancellation_callback_entry;
   struct cancellation_state;
+  struct dispatcher_lifetime;
   struct timer_awaiter;
   struct timer_wait_state;
   void configure_timeout_cancellation(
@@ -779,7 +780,7 @@ namespace internal {
     cancellation_callback_entry* callbacks = nullptr;
     std::vector<cancellation_registration> retained_registrations;
     std::optional<std::chrono::steady_clock::time_point> timeout_deadline;
-    dispatcher* timeout_dispatcher = nullptr;
+    std::shared_ptr<dispatcher_lifetime> timeout_dispatcher_lifetime;
     std::shared_ptr<timer_wait_state> timeout_wait;
     bool timeout_active = false;
 
@@ -833,10 +834,36 @@ namespace internal {
 #endif
 #endif
 
+  struct dispatcher_group_lifetime {
+    std::mutex mutex;
+    dispatcher_group* group;
+
+    inline explicit dispatcher_group_lifetime(
+        dispatcher_group* group) noexcept: group(group) {}
+  };
+
+  struct dispatcher_lifetime {
+    // Timeout cancellation states keep this token after the dispatcher dies.
+    // Holding mutex makes a non-null target safe to use, while group_lifetime
+    // lets an outstanding activity be finished independently of target.
+    std::mutex mutex;
+    dispatcher* target;
+    std::shared_ptr<dispatcher_group_lifetime> group_lifetime;
+
+    inline dispatcher_lifetime(
+        dispatcher* target,
+        std::shared_ptr<dispatcher_group_lifetime> group_lifetime) noexcept
+        : target(target), group_lifetime(std::move(group_lifetime)) {}
+
+    bool add_timeout_activity() noexcept;
+    void finish_timeout_activity() noexcept;
+  };
+
   struct promise_state_base {
     std::mutex mutex;
     std::coroutine_handle<> coroutine;
     dispatcher_group* group = nullptr;
+    std::shared_ptr<dispatcher_group_lifetime> group_lifetime;
 #if CARDIO_HAS_EXCEPTIONS
     std::exception_ptr exception;
 #endif
@@ -2190,6 +2217,7 @@ enum class exit_condition {
 class dispatcher_group {
 private:
   friend class dispatcher;
+  friend struct internal::dispatcher_lifetime;
   friend class dispatcher_host;
 #if CARDIO_HAS_WIN32_HANDLE
   friend class dispatcher_host_win32_auto;
@@ -2208,6 +2236,7 @@ private:
   const exit_condition condition_;
   std::atomic<std::size_t> active_continuations_ = 0;
   std::atomic<bool> shutdown_requested_ = false;
+  std::shared_ptr<internal::dispatcher_group_lifetime> lifetime_;
 
   inline bool empty() const noexcept {
     return active_promises_.load(std::memory_order_acquire) == 0 &&
@@ -2278,8 +2307,15 @@ public:
    * @param condition Group exit condition.
    */
   inline explicit dispatcher_group(
-      exit_condition condition = exit_condition::exit_by_empty) noexcept
-      : condition_(condition) {
+      exit_condition condition = exit_condition::exit_by_empty)
+      : condition_(condition),
+        lifetime_(
+            std::make_shared<internal::dispatcher_group_lifetime>(this)) {
+  }
+
+  inline virtual ~dispatcher_group() {
+    auto lock = std::lock_guard<std::mutex>(lifetime_->mutex);
+    lifetime_->group = nullptr;
   }
 
   /**
@@ -2300,6 +2336,25 @@ public:
   dispatcher_group(const dispatcher_group&) = delete;
   dispatcher_group& operator=(const dispatcher_group&) = delete;
 };
+
+namespace internal {
+  inline bool dispatcher_lifetime::add_timeout_activity() noexcept {
+    auto lock = std::lock_guard<std::mutex>(group_lifetime->mutex);
+    if (group_lifetime->group == nullptr) {
+      return false;
+    }
+
+    group_lifetime->group->add_active_promise();
+    return true;
+  }
+
+  inline void dispatcher_lifetime::finish_timeout_activity() noexcept {
+    auto lock = std::lock_guard<std::mutex>(group_lifetime->mutex);
+    if (group_lifetime->group != nullptr) {
+      group_lifetime->group->finish_active_promise();
+    }
+  }
+}  // namespace internal
 
 //-----------------------------------------------------------------
 
@@ -2397,6 +2452,10 @@ private:
       const std::shared_ptr<internal::cancellation_state>& state);
   friend void internal::disarm_timeout_cancellation(
       const std::shared_ptr<internal::cancellation_state>& state) noexcept;
+  friend void internal::configure_timeout_cancellation(
+      cancellation_source& source,
+      std::chrono::steady_clock::time_point deadline,
+      dispatcher* target);
   friend bool internal::request_cancellation(
       const std::shared_ptr<internal::cancellation_state>& state) noexcept;
   friend struct internal::cancellation_state;
@@ -2404,6 +2463,7 @@ private:
   dispatcher_feature features_ = dispatcher_feature::none;
   std::unique_ptr<dispatcher_group> owned_group_;
   dispatcher_group* group_ = nullptr;
+  std::shared_ptr<internal::dispatcher_lifetime> lifetime_;
   std::mutex mutex_;
   std::condition_variable condition_;
   struct work_item {
@@ -3098,14 +3158,6 @@ private:
     enqueue(work_item{std::move(callback)});
   }
 
-  inline void add_timer_activity() noexcept {
-    group_->add_active_promise();
-  }
-
-  inline void finish_timer_activity() noexcept {
-    group_->finish_active_promise();
-  }
-
   inline void register_timer_wait(
       std::shared_ptr<internal::timer_wait_state> wait,
       std::coroutine_handle<> continuation) {
@@ -3450,7 +3502,9 @@ protected:
   inline dispatcher()
       : features_(default_features()),
         owned_group_(std::make_unique<dispatcher_group>()),
-        group_(owned_group_.get()) {
+        group_(owned_group_.get()),
+        lifetime_(std::make_shared<internal::dispatcher_lifetime>(
+            this, group_->lifetime_)) {
     group_->register_dispatcher(this);
   }
 
@@ -3462,7 +3516,10 @@ protected:
    * @throws std::system_error Thrown if the fd wakeup backend cannot be
    * initialized.
    */
-  inline explicit dispatcher(dispatcher_group& group): group_(&group) {
+  inline explicit dispatcher(dispatcher_group& group)
+      : group_(&group),
+        lifetime_(std::make_shared<internal::dispatcher_lifetime>(
+            this, group_->lifetime_)) {
     features_ = default_features();
     group_->register_dispatcher(this);
   }
@@ -3503,6 +3560,9 @@ public:
 };
 
 inline dispatcher::~dispatcher() {
+  // Invalidate target while excluding timeout registration and cleanup paths.
+  auto lifetime_lock = std::lock_guard<std::mutex>(lifetime_->mutex);
+  lifetime_->target = nullptr;
   clear_timer_waits();
 #if CARDIO_HAS_POSIX_FD
   clear_fd_waits();
@@ -4583,20 +4643,45 @@ private:
     glib_wait_snapshot_valid_ = false;
   }
 
+  inline bool glib_poll_fds_match(
+      const wait_snapshot& snapshot) const noexcept {
+    if (glib_poll_fds_.size() != snapshot.poll_fds.size()) {
+      return false;
+    }
+    for (auto index = std::size_t{0};
+         index < glib_poll_fds_.size(); ++index) {
+      const auto expected = to_glib_poll_fd(snapshot.poll_fds[index]);
+      if (glib_poll_fds_[index].fd != expected.fd ||
+          glib_poll_fds_[index].events != expected.events) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   inline void install_glib_wait_snapshot(wait_snapshot snapshot) {
-    clear_glib_poll_fds();
     if (snapshot.empty()) {
+      clear_glib_poll_fds();
       return;
+    }
+
+    // Replacing poll registrations wakes an attached GMainContext. Preserve
+    // stable registrations so an unchanged fd wait can remain blocked.
+    if (!glib_poll_fds_match(snapshot)) {
+      clear_glib_poll_fds();
+      glib_poll_fds_.reserve(snapshot.poll_fds.size());
+      for (const auto& fd : snapshot.poll_fds) {
+        glib_poll_fds_.push_back(to_glib_poll_fd(fd));
+      }
+      for (auto& fd : glib_poll_fds_) {
+        g_source_add_poll(source_, &fd);
+      }
     }
 
     glib_wait_snapshot_ = std::move(snapshot);
     glib_wait_snapshot_valid_ = true;
-    glib_poll_fds_.reserve(glib_wait_snapshot_.poll_fds.size());
-    for (const auto& fd : glib_wait_snapshot_.poll_fds) {
-      glib_poll_fds_.push_back(to_glib_poll_fd(fd));
-    }
     for (auto& fd : glib_poll_fds_) {
-      g_source_add_poll(source_, &fd);
+      fd.revents = 0;
     }
   }
 
@@ -4914,11 +4999,17 @@ public:
 
 namespace internal {
   inline cancellation_state::~cancellation_state() {
-    if (timeout_dispatcher != nullptr && timeout_wait) {
-      timeout_dispatcher->unregister_timer_wait(timeout_wait);
+    if (!timeout_dispatcher_lifetime) {
+      return;
     }
-    if (timeout_dispatcher != nullptr && timeout_active) {
-      timeout_dispatcher->finish_timer_activity();
+
+    auto lifetime_lock = std::lock_guard<std::mutex>(
+        timeout_dispatcher_lifetime->mutex);
+    if (timeout_dispatcher_lifetime->target != nullptr && timeout_wait) {
+      timeout_dispatcher_lifetime->target->unregister_timer_wait(timeout_wait);
+    }
+    if (timeout_active) {
+      timeout_dispatcher_lifetime->finish_timeout_activity();
     }
   }
 
@@ -4933,7 +5024,8 @@ namespace internal {
     {
       auto lock = std::lock_guard<std::mutex>(source.state_->mutex);
       source.state_->timeout_deadline = deadline;
-      source.state_->timeout_dispatcher = target;
+      source.state_->timeout_dispatcher_lifetime =
+          target != nullptr ? target->lifetime_ : nullptr;
     }
     arm_timeout_cancellation(source.state_);
   }
@@ -4948,7 +5040,8 @@ namespace internal {
     auto retained_registrations =
         std::vector<cancellation_registration>{};
     auto timeout_wait = std::shared_ptr<timer_wait_state>{};
-    auto* timeout_dispatcher = static_cast<dispatcher*>(nullptr);
+    auto timeout_dispatcher_lifetime =
+        std::shared_ptr<dispatcher_lifetime>{};
     auto finish_timeout_activity = false;
 
     {
@@ -4973,16 +5066,21 @@ namespace internal {
       state->callbacks = nullptr;
       retained_registrations = std::move(state->retained_registrations);
       timeout_wait = std::move(state->timeout_wait);
-      timeout_dispatcher = state->timeout_dispatcher;
+      timeout_dispatcher_lifetime = state->timeout_dispatcher_lifetime;
       finish_timeout_activity = state->timeout_active;
       state->timeout_active = false;
     }
 
-    if (timeout_dispatcher != nullptr && timeout_wait) {
-      timeout_dispatcher->unregister_timer_wait(timeout_wait);
-    }
-    if (timeout_dispatcher != nullptr && finish_timeout_activity) {
-      timeout_dispatcher->finish_timer_activity();
+    if (timeout_dispatcher_lifetime) {
+      auto lifetime_lock = std::lock_guard<std::mutex>(
+          timeout_dispatcher_lifetime->mutex);
+      if (timeout_dispatcher_lifetime->target != nullptr && timeout_wait) {
+        timeout_dispatcher_lifetime->target->unregister_timer_wait(
+            timeout_wait);
+      }
+      if (finish_timeout_activity) {
+        timeout_dispatcher_lifetime->finish_timeout_activity();
+      }
     }
 
     for (auto& callback : callbacks) {
@@ -4999,9 +5097,6 @@ namespace internal {
       return;
     }
 
-    auto wait = std::shared_ptr<timer_wait_state>{};
-    auto* target = static_cast<dispatcher*>(nullptr);
-    auto add_activity = false;
     auto cancel_now = false;
     {
       auto lock = std::lock_guard<std::mutex>(state->mutex);
@@ -5012,51 +5107,47 @@ namespace internal {
       if (*state->timeout_deadline <= std::chrono::steady_clock::now()) {
         cancel_now = true;
       } else {
-        target = state->timeout_dispatcher;
-        wait = std::make_shared<timer_wait_state>();
+        auto lifetime = state->timeout_dispatcher_lifetime;
+        if (!lifetime) {
+          return;
+        }
+
+        auto wait = std::make_shared<timer_wait_state>();
         wait->deadline = *state->timeout_deadline;
+        auto weak_state = std::weak_ptr<cancellation_state>(state);
+
+        auto lifetime_lock = std::lock_guard<std::mutex>(lifetime->mutex);
+        auto* target = lifetime->target;
+        if (target == nullptr || !lifetime->add_timeout_activity()) {
+          return;
+        }
+
         state->timeout_wait = wait;
-        add_activity = !state->timeout_active;
         state->timeout_active = true;
+#if CARDIO_HAS_EXCEPTIONS
+        try {
+#endif
+          target->register_timer_callback_wait(
+              wait,
+              [weak_state = std::move(weak_state)] {
+                if (auto locked = weak_state.lock()) {
+                  (void)request_cancellation(locked);
+                }
+              });
+#if CARDIO_HAS_EXCEPTIONS
+        } catch (...) {
+          state->timeout_wait.reset();
+          state->timeout_active = false;
+          target->unregister_timer_wait(wait);
+          lifetime->finish_timeout_activity();
+          throw;
+        }
+#endif
       }
     }
 
     if (cancel_now) {
       (void)request_cancellation(state);
-      return;
-    }
-
-    if (target == nullptr || !wait) {
-      return;
-    }
-
-    if (add_activity) {
-      target->add_timer_activity();
-    }
-
-    auto weak_state = std::weak_ptr<cancellation_state>(state);
-    target->register_timer_callback_wait(
-        wait,
-        [weak_state = std::move(weak_state)] {
-          if (auto locked = weak_state.lock()) {
-            (void)request_cancellation(locked);
-          }
-        });
-
-    auto should_unregister = false;
-    {
-      auto lock = std::lock_guard<std::mutex>(state->mutex);
-      should_unregister =
-          state->cancellation_requested || state->timeout_wait != wait;
-      if (should_unregister && state->timeout_wait == wait) {
-        state->timeout_wait.reset();
-      }
-    }
-    if (should_unregister) {
-      target->unregister_timer_wait(wait);
-      if (add_activity) {
-        target->finish_timer_activity();
-      }
     }
   }
 
@@ -5066,26 +5157,24 @@ namespace internal {
       return;
     }
 
-    auto wait = std::shared_ptr<timer_wait_state>{};
-    auto* target = static_cast<dispatcher*>(nullptr);
-    auto finish_activity = false;
-    {
-      auto lock = std::lock_guard<std::mutex>(state->mutex);
-      if (state->cancellation_requested || state->callbacks != nullptr ||
-          !state->timeout_wait) {
-        return;
-      }
-      wait = std::move(state->timeout_wait);
-      target = state->timeout_dispatcher;
-      finish_activity = state->timeout_active;
-      state->timeout_active = false;
+    auto lock = std::lock_guard<std::mutex>(state->mutex);
+    if (state->cancellation_requested || state->callbacks != nullptr ||
+        !state->timeout_wait) {
+      return;
     }
 
-    if (target != nullptr && wait) {
-      target->unregister_timer_wait(wait);
-    }
-    if (target != nullptr && finish_activity) {
-      target->finish_timer_activity();
+    auto wait = std::move(state->timeout_wait);
+    auto lifetime = state->timeout_dispatcher_lifetime;
+    const auto finish_activity = state->timeout_active;
+    state->timeout_active = false;
+    if (lifetime) {
+      auto lifetime_lock = std::lock_guard<std::mutex>(lifetime->mutex);
+      if (lifetime->target != nullptr) {
+        lifetime->target->unregister_timer_wait(wait);
+      }
+      if (finish_activity) {
+        lifetime->finish_timeout_activity();
+      }
     }
   }
 
@@ -5170,13 +5259,17 @@ namespace internal {
   inline void activate_current_promise(promise_state_base& state) {
     auto& current = internal::require_current_dispatcher();
     state.group = &current.group();
+    state.group_lifetime = state.group->lifetime_;
     state.active_promise.store(true, std::memory_order_release);
     state.group->add_active_promise();
   }
 
   inline void finish_promise(promise_state_base& state) noexcept {
     if (state.active_promise.exchange(false, std::memory_order_acq_rel)) {
-      state.group->finish_active_promise();
+      auto lock = std::lock_guard<std::mutex>(state.group_lifetime->mutex);
+      if (state.group_lifetime->group != nullptr) {
+        state.group_lifetime->group->finish_active_promise();
+      }
     }
   }
 
@@ -12224,7 +12317,7 @@ inline void start_new_worker(
  * Cancellation is cooperative: capture a cardio::cancellation in the callable
  * and pass it to cancellable operations or, when exception support is enabled,
  * call throw_if_cancellation_requested(). The caller dispatcher must outlive
- * the returned promise and the worker completion that resolves it.
+ * the returned promise.
  */
 template <typename Function>
 inline auto start_new(Function&& function) {
