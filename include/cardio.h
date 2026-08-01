@@ -833,10 +833,19 @@ namespace internal {
 #endif
 #endif
 
+  struct dispatcher_group_lifetime {
+    std::mutex mutex;
+    dispatcher_group* group;
+
+    inline explicit dispatcher_group_lifetime(
+        dispatcher_group* group) noexcept: group(group) {}
+  };
+
   struct promise_state_base {
     std::mutex mutex;
     std::coroutine_handle<> coroutine;
     dispatcher_group* group = nullptr;
+    std::shared_ptr<dispatcher_group_lifetime> group_lifetime;
 #if CARDIO_HAS_EXCEPTIONS
     std::exception_ptr exception;
 #endif
@@ -2208,6 +2217,7 @@ private:
   const exit_condition condition_;
   std::atomic<std::size_t> active_continuations_ = 0;
   std::atomic<bool> shutdown_requested_ = false;
+  std::shared_ptr<internal::dispatcher_group_lifetime> lifetime_;
 
   inline bool empty() const noexcept {
     return active_promises_.load(std::memory_order_acquire) == 0 &&
@@ -2278,8 +2288,15 @@ public:
    * @param condition Group exit condition.
    */
   inline explicit dispatcher_group(
-      exit_condition condition = exit_condition::exit_by_empty) noexcept
-      : condition_(condition) {
+      exit_condition condition = exit_condition::exit_by_empty)
+      : condition_(condition),
+        lifetime_(
+            std::make_shared<internal::dispatcher_group_lifetime>(this)) {
+  }
+
+  inline virtual ~dispatcher_group() {
+    auto lock = std::lock_guard<std::mutex>(lifetime_->mutex);
+    lifetime_->group = nullptr;
   }
 
   /**
@@ -5195,13 +5212,17 @@ namespace internal {
   inline void activate_current_promise(promise_state_base& state) {
     auto& current = internal::require_current_dispatcher();
     state.group = &current.group();
+    state.group_lifetime = state.group->lifetime_;
     state.active_promise.store(true, std::memory_order_release);
     state.group->add_active_promise();
   }
 
   inline void finish_promise(promise_state_base& state) noexcept {
     if (state.active_promise.exchange(false, std::memory_order_acq_rel)) {
-      state.group->finish_active_promise();
+      auto lock = std::lock_guard<std::mutex>(state.group_lifetime->mutex);
+      if (state.group_lifetime->group != nullptr) {
+        state.group_lifetime->group->finish_active_promise();
+      }
     }
   }
 
@@ -12249,7 +12270,7 @@ inline void start_new_worker(
  * Cancellation is cooperative: capture a cardio::cancellation in the callable
  * and pass it to cancellable operations or, when exception support is enabled,
  * call throw_if_cancellation_requested(). The caller dispatcher must outlive
- * the returned promise and the worker completion that resolves it.
+ * the returned promise.
  */
 template <typename Function>
 inline auto start_new(Function&& function) {
