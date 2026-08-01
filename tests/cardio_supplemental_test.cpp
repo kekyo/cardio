@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -149,6 +150,37 @@ static void timeout_source_cancels_after_wait() {
   CHECK(!source.cancel());
 
   registration.reset();
+}
+
+static void timeout_source_can_outlive_dispatcher() {
+  auto source_to_cancel = std::optional<cardio::cancellation_source>{};
+  auto source_to_destroy = std::optional<cardio::cancellation_source>{};
+  {
+    test_dispatcher_host dispatcher;
+    source_to_cancel.emplace(cardio::cancellations::timeout(60000));
+    source_to_destroy.emplace(cardio::cancellations::timeout(60000));
+  }
+
+  CHECK(source_to_cancel->cancel());
+  CHECK(source_to_cancel->get_cancellation().is_cancellation_requested());
+  source_to_cancel.reset();
+  source_to_destroy.reset();
+
+  CHECK(!source_to_cancel.has_value());
+  CHECK(!source_to_destroy.has_value());
+
+  cardio::dispatcher_group group;
+  auto source_with_surviving_group =
+      std::optional<cardio::cancellation_source>{};
+  {
+    test_dispatcher_host dispatcher(group);
+    source_with_surviving_group.emplace(
+        cardio::cancellations::timeout(60000));
+  }
+
+  CHECK(source_with_surviving_group->cancel());
+  source_with_surviving_group.reset();
+  CHECK(!source_with_surviving_group.has_value());
 }
 
 static void timeout_cancellation_cancels_delay() {
@@ -306,6 +338,7 @@ int main() {
   any_is_canceled_when_input_already_canceled();
   any_cancels_when_any_input_cancels();
   timeout_source_cancels_after_wait();
+  timeout_source_can_outlive_dispatcher();
   timeout_cancellation_cancels_delay();
   delay_can_be_awaited();
   already_canceled_delay_fails();
