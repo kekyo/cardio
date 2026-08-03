@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  security-events: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -45,7 +46,16 @@ jobs:
           wine --version
           pkg-config --exists liburing glib-2.0 "gio-2.0 >= 2.44"
 
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: c-cpp
+          build-mode: manual
+
       - name: Build and test
         env:
           WINEPREFIX: ${{ runner.temp }}/cardio-wine
         run: xvfb-run --auto-servernum ./build.sh
+
+      - name: Analyze with CodeQL
+        uses: github/codeql-action/analyze@v4
