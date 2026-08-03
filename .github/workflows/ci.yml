@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-24.04
+    env:
+      WINEARCH: win64
+      WINEDEBUG: "-all"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            g++ \
+            g++-mingw-w64-x86-64 \
+            libglib2.0-dev \
+            liburing-dev \
+            make \
+            pkg-config \
+            wine \
+            wine64 \
+            xvfb
+
+      - name: Verify dependencies
+        run: |
+          g++ --version
+          x86_64-w64-mingw32-g++ --version
+          wine --version
+          pkg-config --exists liburing glib-2.0 "gio-2.0 >= 2.44"
+
+      - name: Build and test
+        env:
+          WINEPREFIX: ${{ runner.temp }}/cardio-wine
+        run: xvfb-run --auto-servernum ./build.sh
