@@ -9,7 +9,9 @@
 #include <android/looper.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <latch>
 #include <thread>
 #include <type_traits>
@@ -36,6 +38,26 @@ static void close_fd(int& fd) {
     CHECK_EQ(::close(fd), 0);
     fd = -1;
   }
+}
+
+static void runtime_page_size_matches(const char* expected_value) {
+  auto* end = static_cast<char*>(nullptr);
+  errno = 0;
+  const auto expected = std::strtol(expected_value, &end, 10);
+  CHECK(errno == 0);
+  CHECK(end != expected_value);
+  CHECK(*end == '\0');
+  CHECK(expected > 0);
+
+  const auto actual = ::sysconf(_SC_PAGESIZE);
+  if (actual != expected) {
+    std::fprintf(
+        stderr,
+        "Android page size mismatch: expected %ld, got %ld\n",
+        expected,
+        actual);
+  }
+  CHECK_EQ(actual, expected);
 }
 
 static void write_byte(int fd) {
@@ -347,7 +369,10 @@ static void repeated_host_lifecycle_preserves_looper() {
 
 //-----------------------------------------------------------------------------------------------
 
-int main() {
+int main(int argc, char** argv) {
+  CHECK_EQ(argc, 2);
+  runtime_page_size_matches(argv[1]);
+
   posted_work_runs_and_reports_android_feature();
   timer_resumes_on_owner_thread();
   fd_readiness_resumes_on_owner_thread();

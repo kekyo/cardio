@@ -357,14 +357,10 @@ test-android-runtime: test-android $(ANDROID_RUNTIME_MANUAL_TEST_BIN)
 	if [ "$$actual_api" != "$(ANDROID_EXPECTED_API)" ]; then \
 		echo "Android API mismatch: expected $(ANDROID_EXPECTED_API), got $$actual_api"; exit 1; \
 	fi
-	@actual_page_size="$$( $(ANDROID_ADB) shell getconf PAGE_SIZE | tr -d '\r' )"; \
-	if [ "$$actual_page_size" != "$(ANDROID_EXPECTED_PAGE_SIZE)" ]; then \
-		echo "Android page size mismatch: expected $(ANDROID_EXPECTED_PAGE_SIZE), got $$actual_page_size"; exit 1; \
-	fi
 	$(ANDROID_ADB) shell mkdir -p $(ANDROID_DEVICE_TEST_DIR)
 	$(ANDROID_ADB) push $(ANDROID_RUNTIME_MANUAL_TEST_BIN) $(ANDROID_DEVICE_TEST_DIR)/cardio_android_manual_test
 	$(ANDROID_ADB) shell chmod 755 $(ANDROID_DEVICE_TEST_DIR)/cardio_android_manual_test
-	$(ANDROID_ADB) shell timeout -k 5s 60s $(ANDROID_DEVICE_TEST_DIR)/cardio_android_manual_test
+	$(ANDROID_ADB) shell timeout -k 5s 60s $(ANDROID_DEVICE_TEST_DIR)/cardio_android_manual_test $(ANDROID_EXPECTED_PAGE_SIZE)
 	$(ANDROID_ADB) install -r $(ANDROID_RUNTIME_AUTO_TEST_APK)
 	@output="$$( $(ANDROID_ADB) shell am instrument -w com.example.cardio/.CardioInstrumentation 2>&1 )"; status=$$?; \
 	printf '%s\n' "$$output"; \
