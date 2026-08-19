@@ -31,9 +31,11 @@ ANDROID_AAPT2 ?= $(ANDROID_BUILD_TOOLS)/aapt2
 ANDROID_D8 ?= $(ANDROID_BUILD_TOOLS)/d8
 ANDROID_ZIPALIGN ?= $(ANDROID_BUILD_TOOLS)/zipalign
 ANDROID_APKSIGNER ?= $(ANDROID_BUILD_TOOLS)/apksigner
+ANDROID_READELF ?= $(ANDROID_TOOLCHAIN)/llvm-readelf
 JAVAC ?= javac
 KEYTOOL ?= keytool
 ZIP ?= zip
+UNZIP ?= unzip
 ADB ?= adb
 ADB_SERIAL ?=
 ANDROID_RUNTIME_ABI ?= x86_64
@@ -146,7 +148,7 @@ WIN32_SUPPLEMENTAL_DISABLED_CXXFLAGS := $(WIN32_CXXFLAGS) -DCARDIO_WITH_SUPPLEME
 WIN32_PRIMITIVES_DISABLED_TEST_BIN := $(WIN32_BUILD_DIR)/cardio_primitives_disabled_test_no_primitives.exe
 WIN32_PRIMITIVES_DISABLED_CXXFLAGS := $(WIN32_CXXFLAGS) -DCARDIO_WITH_PRIMITIVES=0
 
-.PHONY: all test test-shared test-win32 test-win32-shared test-android test-android-config test-android-runtime clean
+.PHONY: all test test-shared test-win32 test-win32-shared test-android test-android-config test-android-artifacts test-android-runtime clean
 
 all: $(TEST_BINS) $(NO_EXCEPTIONS_TEST_BIN) $(NO_POSIX_TEST_BIN) $(SUPPLEMENTAL_DISABLED_TEST_BIN) $(PRIMITIVES_DISABLED_TEST_BIN) $(IO_URING_TEST_BINS) $(GLIB_TEST_BINS) $(GIO_TEST_BINS)
 
@@ -323,7 +325,22 @@ test-android-config: $(ANDROID_X86_64_CONFIG_TEST_OBJ) $(ANDROID_ARM64_CONFIG_TE
 		printf '%s\n' "$$output"; echo "cardio_android_io_uring_test (arm64-v8a): FAIL"; exit 1; \
 	fi
 
-test-android: test-android-config $(ANDROID_X86_64_MANUAL_TEST_BIN) $(ANDROID_ARM64_MANUAL_TEST_BIN) $(ANDROID_X86_64_AUTO_TEST_APK) $(ANDROID_ARM64_AUTO_TEST_APK)
+test-android-artifacts: $(ANDROID_X86_64_MANUAL_TEST_BIN) $(ANDROID_ARM64_MANUAL_TEST_BIN) $(ANDROID_X86_64_AUTO_TEST_APK) $(ANDROID_ARM64_AUTO_TEST_APK)
+	@for binary in $(ANDROID_X86_64_MANUAL_TEST_BIN) $(ANDROID_ARM64_MANUAL_TEST_BIN) $(ANDROID_X86_64_AUTO_TEST_LIB) $(ANDROID_ARM64_AUTO_TEST_LIB); do \
+		alignments="$$( $(ANDROID_READELF) -lW $$binary | awk '$$1 == "LOAD" { print $$NF }' | sort -u )"; \
+		if [ "$$alignments" != "0x4000" ]; then \
+			echo "Android ELF alignment mismatch: $$binary ($$alignments)"; exit 1; \
+		fi; \
+	done
+	$(ANDROID_ZIPALIGN) -c -P 16 4 $(ANDROID_X86_64_AUTO_TEST_APK)
+	$(ANDROID_ZIPALIGN) -c -P 16 4 $(ANDROID_ARM64_AUTO_TEST_APK)
+	@$(ANDROID_AAPT2) dump badging $(ANDROID_X86_64_AUTO_TEST_APK) | grep -Fqx "minSdkVersion:'24'"
+	@$(ANDROID_AAPT2) dump badging $(ANDROID_ARM64_AUTO_TEST_APK) | grep -Fqx "minSdkVersion:'24'"
+	@$(UNZIP) -Z1 $(ANDROID_X86_64_AUTO_TEST_APK) | grep -Fqx "lib/x86_64/libcardio_android_auto_test.so"
+	@$(UNZIP) -Z1 $(ANDROID_ARM64_AUTO_TEST_APK) | grep -Fqx "lib/arm64-v8a/libcardio_android_auto_test.so"
+	@echo "cardio_android_artifacts_test: PASS"
+
+test-android: test-android-config test-android-artifacts
 
 test-android-runtime: test-android $(ANDROID_RUNTIME_MANUAL_TEST_BIN)
 	@if [ -z "$(ANDROID_EXPECTED_API)" ]; then \

@@ -21,16 +21,29 @@ public final class CardioInstrumentation extends Instrumentation {
     Activity activity = null;
 
     try {
-      CardioActivity.prepareTest();
-      final Intent intent = new Intent(Intent.ACTION_MAIN);
-      intent.setClassName(
-          getTargetContext(), CardioActivity.class.getName());
-      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-      activity = startActivitySync(intent);
+      for (int iteration = 0; iteration < 8; ++iteration) {
+        CardioActivity.prepareTest();
+        final Intent intent = new Intent(Intent.ACTION_MAIN);
+        intent.setClassName(
+            getTargetContext(), CardioActivity.class.getName());
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        activity = startActivitySync(intent);
 
-      final String failure = CardioActivity.awaitTest();
-      if (failure != null) {
-        throw new AssertionError(failure);
+        final String failure = CardioActivity.awaitTest();
+        if (failure != null) {
+          throw new AssertionError(
+              "iteration " + iteration + ": " + failure);
+        }
+
+        final Activity target = activity;
+        runOnMainSync(new Runnable() {
+          @Override
+          public void run() {
+            target.finish();
+          }
+        });
+        waitForIdleSync();
+        activity = null;
       }
 
       results.putString(
