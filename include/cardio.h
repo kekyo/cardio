@@ -171,6 +171,12 @@
 #include <unistd.h>
 #endif
 
+#if defined(__ANDROID__)
+#include <android/looper.h>
+#include <sys/eventfd.h>
+#include <sys/timerfd.h>
+#endif
+
 #if CARDIO_WITH_LINUX_IO_URING
 #include <liburing.h>
 #include <sys/eventfd.h>
@@ -197,6 +203,10 @@ class cancellation_source;
 class dispatcher_group;
 class dispatcher;
 class dispatcher_host;
+#if defined(__ANDROID__)
+class dispatcher_host_android;
+class dispatcher_host_android_auto;
+#endif
 #if CARDIO_HAS_WIN32_HANDLE
 class dispatcher_host_win32_auto;
 #endif
@@ -207,6 +217,9 @@ class dispatcher_host_glib_auto;
 #endif
 
 namespace internal {
+#if defined(__ANDROID__)
+  class dispatcher_host_android_base;
+#endif
   struct cancellation_callback_entry;
   struct cancellation_state;
   struct dispatcher_lifetime;
@@ -2232,6 +2245,9 @@ private:
   friend class dispatcher;
   friend struct internal::dispatcher_lifetime;
   friend class dispatcher_host;
+#if defined(__ANDROID__)
+  friend class internal::dispatcher_host_android_base;
+#endif
 #if CARDIO_HAS_WIN32_HANDLE
   friend class dispatcher_host_win32_auto;
 #endif
@@ -2434,6 +2450,9 @@ class dispatcher {
 private:
   friend class dispatcher_group;
   friend class dispatcher_host;
+#if defined(__ANDROID__)
+  friend class internal::dispatcher_host_android_base;
+#endif
 #if CARDIO_HAS_WIN32_HANDLE
   friend class dispatcher_host_win32_auto;
 #endif
@@ -3857,6 +3876,654 @@ public:
  * Alias for dispatcher_host in Win32 HANDLE builds.
  */
 using dispatcher_host_win32 = dispatcher_host;
+#endif
+
+//-----------------------------------------------------------------------------------------------
+
+#if defined(__ANDROID__)
+namespace internal {
+  class dispatcher_host_android_base;
+
+  struct android_looper_callback_entry {
+    std::uintptr_t token = 0;
+    dispatcher_host_android_base* owner = nullptr;
+  };
+
+  struct android_looper_callback_registry {
+    std::mutex mutex;
+    std::vector<android_looper_callback_entry> entries;
+    std::atomic<std::uintptr_t> next_token = 1;
+  };
+
+  inline android_looper_callback_registry&
+  get_android_looper_callback_registry() noexcept {
+    static android_looper_callback_registry registry;
+    return registry;
+  }
+
+  inline std::uintptr_t register_android_looper_callback(
+      dispatcher_host_android_base* owner) {
+    auto& registry = get_android_looper_callback_registry();
+    auto token = registry.next_token.fetch_add(1, std::memory_order_relaxed);
+    if (token == 0) {
+      token = registry.next_token.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    auto lock = std::lock_guard<std::mutex>(registry.mutex);
+    registry.entries.push_back(android_looper_callback_entry{token, owner});
+    return token;
+  }
+
+  inline void unregister_android_looper_callback(
+      std::uintptr_t token) noexcept {
+    if (token == 0) {
+      return;
+    }
+
+    auto& registry = get_android_looper_callback_registry();
+    auto lock = std::lock_guard<std::mutex>(registry.mutex);
+    for (auto iterator = registry.entries.begin();
+         iterator != registry.entries.end(); ++iterator) {
+      if (iterator->token == token) {
+        registry.entries.erase(iterator);
+        return;
+      }
+    }
+  }
+
+  inline dispatcher_host_android_base* find_android_looper_callback(
+      std::uintptr_t token) noexcept {
+    auto& registry = get_android_looper_callback_registry();
+    auto lock = std::lock_guard<std::mutex>(registry.mutex);
+    for (const auto& entry : registry.entries) {
+      if (entry.token == token) {
+        return entry.owner;
+      }
+    }
+    return nullptr;
+  }
+
+  class dispatcher_host_android_base : public dispatcher {
+  private:
+    struct looper_registration {
+      int fd = -1;
+      int events = 0;
+      std::uintptr_t token = 0;
+    };
+
+    struct desired_registration {
+      int fd = -1;
+      int events = 0;
+    };
+
+    ALooper* looper_ = nullptr;
+    int event_fd_ = -1;
+    int timer_fd_ = -1;
+    looper_registration event_registration_;
+    looper_registration timer_registration_;
+    std::vector<looper_registration> wait_registrations_;
+    dispatcher::wait_snapshot looper_wait_snapshot_;
+    bool looper_wait_snapshot_valid_ = false;
+    std::thread::id owner_thread_;
+    shutdown_mode active_shutdown_mode_ = shutdown_mode::gentle;
+    bool parked_ = false;
+
+    class execution_scope {
+    private:
+      dispatcher* previous_dispatcher_ = nullptr;
+      bool installed_dispatcher_ = false;
+
+    public:
+      inline explicit execution_scope(dispatcher_host_android_base& owner)
+          : previous_dispatcher_(
+                internal::runtime_state().current_dispatcher) {
+        if (previous_dispatcher_ != nullptr && previous_dispatcher_ != &owner) {
+          internal::fail_runtime_error(
+              "cardio: active dispatcher does not match Android Looper callback");
+        }
+        if (previous_dispatcher_ == nullptr) {
+          internal::runtime_state().current_dispatcher = &owner;
+          installed_dispatcher_ = true;
+        }
+      }
+
+      inline ~execution_scope() {
+        if (installed_dispatcher_) {
+          internal::runtime_state().current_dispatcher = previous_dispatcher_;
+        }
+      }
+
+      execution_scope(const execution_scope&) = delete;
+      execution_scope& operator=(const execution_scope&) = delete;
+    };
+
+    static inline int to_looper_events(short events) noexcept {
+      auto result = 0;
+      if ((events & (POLLIN | POLLPRI)) != 0) {
+        result |= ALOOPER_EVENT_INPUT;
+      }
+      if ((events & POLLOUT) != 0) {
+        result |= ALOOPER_EVENT_OUTPUT;
+      }
+      return result;
+    }
+
+    static inline short from_looper_events(int events) noexcept {
+      auto result = short{};
+      if ((events & ALOOPER_EVENT_INPUT) != 0) {
+        result |= POLLIN;
+      }
+      if ((events & ALOOPER_EVENT_OUTPUT) != 0) {
+        result |= POLLOUT;
+      }
+      if ((events & ALOOPER_EVENT_ERROR) != 0) {
+        result |= POLLERR;
+      }
+      if ((events & ALOOPER_EVENT_HANGUP) != 0) {
+        result |= POLLHUP;
+      }
+      if ((events & ALOOPER_EVENT_INVALID) != 0) {
+        result |= POLLNVAL;
+      }
+      return result;
+    }
+
+    inline void ensure_owner_thread() const {
+      if (std::this_thread::get_id() != owner_thread_) {
+        internal::fail_runtime_error(
+            "cardio: Android dispatcher must be used on its owner thread");
+      }
+    }
+
+    inline looper_registration add_looper_registration(
+        int fd,
+        int events) {
+      auto registration = looper_registration{fd, events, 0};
+      registration.token =
+          internal::register_android_looper_callback(this);
+      if (ALooper_addFd(
+              looper_,
+              fd,
+              ALOOPER_POLL_CALLBACK,
+              events,
+              &dispatcher_host_android_base::looper_callback,
+              reinterpret_cast<void*>(registration.token)) != 1) {
+        internal::unregister_android_looper_callback(registration.token);
+        internal::fail_runtime_error(
+            "cardio: ALooper_addFd failed for Android dispatcher");
+      }
+      return registration;
+    }
+
+    inline void remove_looper_registration(
+        looper_registration& registration) noexcept {
+      if (registration.token == 0) {
+        return;
+      }
+
+      internal::unregister_android_looper_callback(registration.token);
+      if (looper_ != nullptr && registration.fd >= 0) {
+        (void)ALooper_removeFd(looper_, registration.fd);
+      }
+      registration = looper_registration{};
+    }
+
+    static inline bool desired_contains(
+        const std::vector<desired_registration>& desired,
+        int fd,
+        int events) noexcept {
+      for (const auto& registration : desired) {
+        if (registration.fd == fd && registration.events == events) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    static inline bool installed_contains(
+        const std::vector<looper_registration>& installed,
+        int fd,
+        int events) noexcept {
+      for (const auto& registration : installed) {
+        if (registration.fd == fd && registration.events == events) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    static inline std::vector<desired_registration>
+    make_desired_registrations(const dispatcher::wait_snapshot& snapshot) {
+      auto desired = std::vector<desired_registration>{};
+      desired.reserve(snapshot.poll_fds.size());
+      for (const auto& fd : snapshot.poll_fds) {
+        const auto events = to_looper_events(fd.events);
+        auto* existing = static_cast<desired_registration*>(nullptr);
+        for (auto& registration : desired) {
+          if (registration.fd == fd.fd) {
+            existing = &registration;
+            break;
+          }
+        }
+        if (existing != nullptr) {
+          existing->events |= events;
+        } else {
+          desired.push_back(desired_registration{fd.fd, events});
+        }
+      }
+      return desired;
+    }
+
+    inline void install_wait_registrations(
+        const dispatcher::wait_snapshot& snapshot) {
+      const auto desired = make_desired_registrations(snapshot);
+
+      for (auto index = std::size_t{0}; index < wait_registrations_.size();) {
+        auto& registration = wait_registrations_[index];
+        if (desired_contains(desired, registration.fd, registration.events)) {
+          ++index;
+          continue;
+        }
+
+        remove_looper_registration(registration);
+        wait_registrations_.erase(wait_registrations_.begin() + index);
+      }
+
+      for (const auto& registration : desired) {
+        if (!installed_contains(
+                wait_registrations_, registration.fd, registration.events)) {
+          wait_registrations_.push_back(
+              add_looper_registration(registration.fd, registration.events));
+        }
+      }
+    }
+
+    inline void arm_timer(
+        std::optional<std::chrono::steady_clock::time_point> deadline) {
+      auto specification = itimerspec{};
+      if (deadline) {
+        auto remaining = *deadline - std::chrono::steady_clock::now();
+        auto nanoseconds =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(remaining);
+        if (nanoseconds.count() <= 0) {
+          nanoseconds = std::chrono::nanoseconds{1};
+        }
+        specification.it_value.tv_sec = static_cast<time_t>(
+            nanoseconds.count() / 1000000000LL);
+        specification.it_value.tv_nsec = static_cast<long>(
+            nanoseconds.count() % 1000000000LL);
+      }
+
+      if (::timerfd_settime(timer_fd_, 0, &specification, nullptr) == -1) {
+        internal::fail_system_error(
+            errno, "cardio: timerfd_settime failed for Android dispatcher");
+      }
+    }
+
+    inline void refresh_looper_wait_snapshot() {
+      auto snapshot = dispatcher::wait_snapshot{};
+      {
+        auto lock = std::lock_guard<std::mutex>(mutex_);
+        mark_wait_polling(false);
+        if (!group_->should_exit_immediately(active_shutdown_mode_)) {
+          snapshot = make_wait_snapshot();
+          if (!snapshot.empty()) {
+            mark_wait_polling(true);
+          }
+        }
+      }
+
+      install_wait_registrations(snapshot);
+      arm_timer(snapshot.deadline);
+      looper_wait_snapshot_ = std::move(snapshot);
+      looper_wait_snapshot_valid_ = !looper_wait_snapshot_.empty();
+    }
+
+    inline void drain_event_fd() noexcept {
+      auto value = eventfd_t{};
+      while (eventfd_read(event_fd_, &value) == 0) {
+      }
+    }
+
+    inline void drain_timer_fd() noexcept {
+      auto expirations = std::uint64_t{};
+      while (true) {
+        const auto result = ::read(
+            timer_fd_, &expirations, sizeof(expirations));
+        if (result == static_cast<ssize_t>(sizeof(expirations))) {
+          continue;
+        }
+        if (result == -1 && errno == EINTR) {
+          continue;
+        }
+        return;
+      }
+    }
+
+    inline void copy_looper_revents(int fd, int events) noexcept {
+      if (!looper_wait_snapshot_valid_) {
+        return;
+      }
+
+      const auto revents = from_looper_events(events);
+      for (auto& current : looper_wait_snapshot_.poll_fds) {
+        if (current.fd == fd) {
+          current.revents |= revents;
+        }
+      }
+      for (auto index = std::size_t{0};
+           index < looper_wait_snapshot_.fd_snapshot.poll_fds.size(); ++index) {
+        looper_wait_snapshot_.fd_snapshot.poll_fds[index].revents =
+            looper_wait_snapshot_.poll_fds[index].revents;
+      }
+    }
+
+    inline work_item take_next_work() {
+      auto work = work_item{};
+      auto lock = std::lock_guard<std::mutex>(mutex_);
+      if (!group_->should_exit_immediately(active_shutdown_mode_) &&
+          !queue_.empty()) {
+        mark_wait_polling(false);
+        work = std::move(queue_.front());
+        queue_.pop_front();
+        ++active_continuations_;
+      }
+      return work;
+    }
+
+    inline bool has_queued_work() noexcept {
+      auto lock = std::lock_guard<std::mutex>(mutex_);
+      return !queue_.empty();
+    }
+
+    inline void execute_android_work(work_item& work) {
+      group_->start_continuation();
+      auto active_scope = active_continuation_guard(*this);
+      auto execution = execution_scope(*this);
+      (void)execution;
+      execute_work_body(work);
+      drain_inline_continuations({}, active_shutdown_mode_);
+    }
+
+    inline int dispatch_looper_event_impl(
+        std::uintptr_t token,
+        int fd,
+        int events) {
+      ensure_owner_thread();
+
+      if (token == event_registration_.token && fd == event_fd_) {
+        drain_event_fd();
+      } else if (token == timer_registration_.token && fd == timer_fd_) {
+        drain_timer_fd();
+      } else {
+        auto matched = false;
+        for (const auto& registration : wait_registrations_) {
+          if (registration.token == token && registration.fd == fd) {
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) {
+          return 0;
+        }
+        copy_looper_revents(fd, events);
+      }
+
+      if (looper_wait_snapshot_valid_) {
+        auto snapshot = std::move(looper_wait_snapshot_);
+        looper_wait_snapshot_valid_ = false;
+        (void)collect_ready_wait_snapshot(snapshot);
+      } else {
+        (void)collect_ready_timer_waits();
+      }
+
+      auto work = take_next_work();
+      if (work) {
+        execute_android_work(work);
+      }
+
+      refresh_looper_wait_snapshot();
+      if (!group_->should_exit_immediately(active_shutdown_mode_) &&
+          has_queued_work()) {
+        notify_external_event();
+      }
+      return 1;
+    }
+
+    inline int dispatch_looper_event_noexcept(
+        std::uintptr_t token,
+        int fd,
+        int events) noexcept {
+#if CARDIO_HAS_EXCEPTIONS
+      try {
+        return dispatch_looper_event_impl(token, fd, events);
+      } catch (...) {
+        handle_unhandled_exception(std::current_exception());
+        return 1;
+      }
+#else
+      return dispatch_looper_event_impl(token, fd, events);
+#endif
+    }
+
+    static inline int looper_callback(
+        int fd,
+        int events,
+        void* data) noexcept {
+      const auto token = reinterpret_cast<std::uintptr_t>(data);
+      auto* owner = internal::find_android_looper_callback(token);
+      if (owner == nullptr) {
+        return 0;
+      }
+      return owner->dispatch_looper_event_noexcept(token, fd, events);
+    }
+
+    inline void detach_looper() noexcept {
+      for (auto& registration : wait_registrations_) {
+        remove_looper_registration(registration);
+      }
+      wait_registrations_.clear();
+      remove_looper_registration(event_registration_);
+      remove_looper_registration(timer_registration_);
+      looper_wait_snapshot_ = dispatcher::wait_snapshot{};
+      looper_wait_snapshot_valid_ = false;
+
+      if (event_fd_ >= 0) {
+        (void)::close(event_fd_);
+        event_fd_ = -1;
+      }
+      if (timer_fd_ >= 0) {
+        (void)::close(timer_fd_);
+        timer_fd_ = -1;
+      }
+      if (looper_ != nullptr) {
+        ALooper_release(looper_);
+        looper_ = nullptr;
+      }
+    }
+
+    inline void initialize_looper(bool prepare_if_missing) {
+      owner_thread_ = std::this_thread::get_id();
+      looper_ = ALooper_forThread();
+      if (looper_ == nullptr && prepare_if_missing) {
+        looper_ = ALooper_prepare(0);
+      }
+      if (looper_ == nullptr) {
+        internal::fail_runtime_error(
+            "cardio: current thread does not have an Android Looper");
+      }
+      ALooper_acquire(looper_);
+
+#if CARDIO_HAS_EXCEPTIONS
+      try {
+#endif
+        event_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (event_fd_ == -1) {
+          internal::fail_system_error(
+              errno, "cardio: eventfd failed for Android dispatcher");
+        }
+        timer_fd_ = timerfd_create(
+            CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+        if (timer_fd_ == -1) {
+          internal::fail_system_error(
+              errno, "cardio: timerfd_create failed for Android dispatcher");
+        }
+
+        event_registration_ = add_looper_registration(
+            event_fd_, ALOOPER_EVENT_INPUT);
+        timer_registration_ = add_looper_registration(
+            timer_fd_, ALOOPER_EVENT_INPUT);
+        refresh_looper_wait_snapshot();
+#if CARDIO_HAS_EXCEPTIONS
+      } catch (...) {
+        detach_looper();
+        throw;
+      }
+#endif
+    }
+
+  protected:
+    inline explicit dispatcher_host_android_base(bool prepare_if_missing)
+        : dispatcher() {
+      initialize_looper(prepare_if_missing);
+    }
+
+    inline dispatcher_host_android_base(
+        dispatcher_group& group,
+        bool prepare_if_missing)
+        : dispatcher(group) {
+      initialize_looper(prepare_if_missing);
+    }
+
+    inline ~dispatcher_host_android_base() override {
+      detach_looper();
+    }
+
+    inline void park_looper(
+        shutdown_mode mode = shutdown_mode::gentle) {
+      ensure_owner_thread();
+      if (parked_) {
+        internal::fail_runtime_error(
+            "cardio: Android dispatcher is already parked");
+      }
+
+      struct park_scope {
+        dispatcher_host_android_base& owner;
+
+        inline explicit park_scope(
+            dispatcher_host_android_base& owner) noexcept
+            : owner(owner) {
+          owner.parked_ = true;
+        }
+
+        inline ~park_scope() noexcept {
+          owner.parked_ = false;
+          owner.active_shutdown_mode_ = shutdown_mode::gentle;
+        }
+      } scope(*this);
+      (void)scope;
+
+      active_shutdown_mode_ = mode;
+      while (true) {
+        auto timeout_milliseconds = -1;
+        if (group_->is_shutdown_requested()) {
+          if (mode == shutdown_mode::unsafe_immediate) {
+            return;
+          }
+          if (group_->work_drained()) {
+            timeout_milliseconds = 0;
+          }
+        } else if (group_->should_exit(mode)) {
+          return;
+        }
+
+        const auto result = ALooper_pollOnce(
+            timeout_milliseconds, nullptr, nullptr, nullptr);
+        if (result == ALOOPER_POLL_ERROR) {
+          internal::fail_runtime_error(
+              "cardio: ALooper_pollOnce failed for Android dispatcher");
+        }
+        if (timeout_milliseconds == 0 &&
+            result == ALOOPER_POLL_TIMEOUT && group_->work_drained()) {
+          return;
+        }
+      }
+    }
+
+    inline void notify_external_event() noexcept override {
+      if (event_fd_ >= 0) {
+        while (eventfd_write(event_fd_, 1) == -1 && errno == EINTR) {
+        }
+      }
+      if (looper_ != nullptr) {
+        ALooper_wake(looper_);
+      }
+    }
+
+    dispatcher_host_android_base(const dispatcher_host_android_base&) = delete;
+    dispatcher_host_android_base& operator=(
+        const dispatcher_host_android_base&) = delete;
+  };
+}  // namespace internal
+
+/**
+ * Dispatches continuations together with an Android native Looper.
+ *
+ * @remarks
+ * The host attaches to the current thread's ALooper or prepares one when the
+ * thread has none. Construction, park(), and destruction must all occur on the
+ * same native loop-owning thread. Do not call park() on a Java UI thread; use
+ * dispatcher_host_android_auto there instead. Existing callback-based ALooper
+ * file descriptor registrations continue to be dispatched by park().
+ */
+class dispatcher_host_android final
+    : public internal::dispatcher_host_android_base {
+public:
+  /**
+   * Creates an Android dispatcher host with an implicit dispatcher group.
+   *
+   * @throws std::system_error Thrown when eventfd or timerfd initialization
+   * fails.
+   * @throws std::runtime_error Thrown when ALooper initialization fails.
+   */
+  inline dispatcher_host_android()
+      : internal::dispatcher_host_android_base(true) {
+  }
+
+  /**
+   * Creates an Android dispatcher host in an existing dispatcher group.
+   *
+   * @param group Dispatcher group shared with other dispatchers.
+   * @throws std::system_error Thrown when eventfd or timerfd initialization
+   * fails.
+   * @throws std::runtime_error Thrown when ALooper initialization fails.
+   */
+  inline explicit dispatcher_host_android(dispatcher_group& group)
+      : internal::dispatcher_host_android_base(group, true) {
+  }
+
+  /**
+   * Destroys the Android dispatcher host on its owner thread.
+   */
+  inline ~dispatcher_host_android() override = default;
+
+  /**
+   * Parks the owner thread and dispatches ALooper and cardio work.
+   *
+   * @param mode Shutdown mode for this park call.
+   * @throws std::runtime_error Thrown when called from a non-owner thread or
+   * while the host is already parked.
+   */
+  inline void park(shutdown_mode mode = shutdown_mode::gentle) {
+    park_looper(mode);
+  }
+
+  dispatcher_host_android(const dispatcher_host_android&) = delete;
+  dispatcher_host_android& operator=(const dispatcher_host_android&) = delete;
+};
+
+//-----------------------------------------------------------------------------------------------
+
 #endif
 
 //-----------------------------------------------------------------------------------------------

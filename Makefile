@@ -19,7 +19,16 @@ ANDROID_HOST_TAG ?= linux-x86_64
 ANDROID_TOOLCHAIN := $(ANDROID_NDK_ROOT)/toolchains/llvm/prebuilt/$(ANDROID_HOST_TAG)/bin
 ANDROID_X86_64_CXX ?= $(ANDROID_TOOLCHAIN)/x86_64-linux-android$(ANDROID_API)-clang++
 ANDROID_ARM64_CXX ?= $(ANDROID_TOOLCHAIN)/aarch64-linux-android$(ANDROID_API)-clang++
-ANDROID_CXXFLAGS ?= -std=c++20 -Wall -Wextra -Wpedantic -Iinclude
+ANDROID_CXXFLAGS ?= -std=c++20 -Wall -Wextra -Wpedantic -pthread -Iinclude -Itests
+ANDROID_LDFLAGS ?= -static-libstdc++ -Wl,-z,max-page-size=16384
+ANDROID_LDLIBS ?= -landroid
+ADB ?= adb
+ADB_SERIAL ?=
+ANDROID_RUNTIME_ABI ?= x86_64
+ANDROID_EXPECTED_API ?=
+ANDROID_EXPECTED_PAGE_SIZE ?=
+ANDROID_DEVICE_TEST_DIR ?= /data/local/tmp/cardio-tests
+ANDROID_ADB := $(ADB) $(if $(strip $(ADB_SERIAL)),-s $(ADB_SERIAL),)
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
@@ -38,8 +47,18 @@ ANDROID_ARM64_BUILD_DIR := $(ANDROID_BUILD_DIR)/arm64-v8a
 ANDROID_CONFIG_TEST_SRC := tests/android/cardio_android_config_test.cpp
 ANDROID_POSIX_DISABLED_TEST_SRC := tests/android/cardio_android_posix_disabled_test.cpp
 ANDROID_IO_URING_TEST_SRC := tests/android/cardio_android_io_uring_test.cpp
+ANDROID_MANUAL_TEST_SRC := tests/android/cardio_android_manual_test.cpp
 ANDROID_X86_64_CONFIG_TEST_OBJ := $(ANDROID_X86_64_BUILD_DIR)/cardio_android_config_test.o
 ANDROID_ARM64_CONFIG_TEST_OBJ := $(ANDROID_ARM64_BUILD_DIR)/cardio_android_config_test.o
+ANDROID_X86_64_MANUAL_TEST_BIN := $(ANDROID_X86_64_BUILD_DIR)/cardio_android_manual_test
+ANDROID_ARM64_MANUAL_TEST_BIN := $(ANDROID_ARM64_BUILD_DIR)/cardio_android_manual_test
+ifeq ($(ANDROID_RUNTIME_ABI),x86_64)
+ANDROID_RUNTIME_MANUAL_TEST_BIN := $(ANDROID_X86_64_MANUAL_TEST_BIN)
+else ifeq ($(ANDROID_RUNTIME_ABI),arm64-v8a)
+ANDROID_RUNTIME_MANUAL_TEST_BIN := $(ANDROID_ARM64_MANUAL_TEST_BIN)
+else
+$(error Unsupported ANDROID_RUNTIME_ABI: $(ANDROID_RUNTIME_ABI))
+endif
 NO_EXCEPTIONS_TEST_SRC := tests/cardio_no_exceptions_test.cpp
 NO_EXCEPTIONS_TEST_BIN := $(BUILD_DIR)/cardio_no_exceptions_test_no_exceptions
 NO_EXCEPTIONS_CXXFLAGS := $(CXXFLAGS) -fno-exceptions
@@ -99,7 +118,7 @@ WIN32_SUPPLEMENTAL_DISABLED_CXXFLAGS := $(WIN32_CXXFLAGS) -DCARDIO_WITH_SUPPLEME
 WIN32_PRIMITIVES_DISABLED_TEST_BIN := $(WIN32_BUILD_DIR)/cardio_primitives_disabled_test_no_primitives.exe
 WIN32_PRIMITIVES_DISABLED_CXXFLAGS := $(WIN32_CXXFLAGS) -DCARDIO_WITH_PRIMITIVES=0
 
-.PHONY: all test test-shared test-win32 test-win32-shared test-android-config clean
+.PHONY: all test test-shared test-win32 test-win32-shared test-android test-android-config test-android-runtime clean
 
 all: $(TEST_BINS) $(NO_EXCEPTIONS_TEST_BIN) $(NO_POSIX_TEST_BIN) $(SUPPLEMENTAL_DISABLED_TEST_BIN) $(PRIMITIVES_DISABLED_TEST_BIN) $(IO_URING_TEST_BINS) $(GLIB_TEST_BINS) $(GIO_TEST_BINS)
 
@@ -132,6 +151,12 @@ $(ANDROID_X86_64_CONFIG_TEST_OBJ): $(ANDROID_CONFIG_TEST_SRC) include/cardio.h M
 
 $(ANDROID_ARM64_CONFIG_TEST_OBJ): $(ANDROID_CONFIG_TEST_SRC) include/cardio.h Makefile | $(ANDROID_ARM64_BUILD_DIR)
 	$(ANDROID_ARM64_CXX) $(CXXOPT) $(ANDROID_CXXFLAGS) -c $< -o $@
+
+$(ANDROID_X86_64_MANUAL_TEST_BIN): $(ANDROID_MANUAL_TEST_SRC) include/cardio.h tests/test_helpers.h Makefile | $(ANDROID_X86_64_BUILD_DIR)
+	$(ANDROID_X86_64_CXX) $(CXXOPT) $(ANDROID_CXXFLAGS) $< -o $@ $(ANDROID_LDFLAGS) $(ANDROID_LDLIBS)
+
+$(ANDROID_ARM64_MANUAL_TEST_BIN): $(ANDROID_MANUAL_TEST_SRC) include/cardio.h tests/test_helpers.h Makefile | $(ANDROID_ARM64_BUILD_DIR)
+	$(ANDROID_ARM64_CXX) $(CXXOPT) $(ANDROID_CXXFLAGS) $< -o $@ $(ANDROID_LDFLAGS) $(ANDROID_LDLIBS)
 
 $(NO_EXCEPTIONS_TEST_BIN): $(NO_EXCEPTIONS_TEST_SRC) include/cardio.h tests/test_helpers.h Makefile | $(BUILD_DIR)
 	$(CXX) $(CXXOPT) $(NO_EXCEPTIONS_CXXFLAGS) $< -o $@ $(LDLIBS)
@@ -230,6 +255,32 @@ test-android-config: $(ANDROID_X86_64_CONFIG_TEST_OBJ) $(ANDROID_ARM64_CONFIG_TE
 	else \
 		printf '%s\n' "$$output"; echo "cardio_android_io_uring_test (arm64-v8a): FAIL"; exit 1; \
 	fi
+
+test-android: test-android-config $(ANDROID_X86_64_MANUAL_TEST_BIN) $(ANDROID_ARM64_MANUAL_TEST_BIN)
+
+test-android-runtime: test-android $(ANDROID_RUNTIME_MANUAL_TEST_BIN)
+	@if [ -z "$(ANDROID_EXPECTED_API)" ]; then \
+		echo "ANDROID_EXPECTED_API is required"; exit 1; \
+	fi
+	@if [ -z "$(ANDROID_EXPECTED_PAGE_SIZE)" ]; then \
+		echo "ANDROID_EXPECTED_PAGE_SIZE is required"; exit 1; \
+	fi
+	@actual_abi="$$( $(ANDROID_ADB) shell getprop ro.product.cpu.abi | tr -d '\r' )"; \
+	if [ "$$actual_abi" != "$(ANDROID_RUNTIME_ABI)" ]; then \
+		echo "Android ABI mismatch: expected $(ANDROID_RUNTIME_ABI), got $$actual_abi"; exit 1; \
+	fi
+	@actual_api="$$( $(ANDROID_ADB) shell getprop ro.build.version.sdk | tr -d '\r' )"; \
+	if [ "$$actual_api" != "$(ANDROID_EXPECTED_API)" ]; then \
+		echo "Android API mismatch: expected $(ANDROID_EXPECTED_API), got $$actual_api"; exit 1; \
+	fi
+	@actual_page_size="$$( $(ANDROID_ADB) shell getconf PAGE_SIZE | tr -d '\r' )"; \
+	if [ "$$actual_page_size" != "$(ANDROID_EXPECTED_PAGE_SIZE)" ]; then \
+		echo "Android page size mismatch: expected $(ANDROID_EXPECTED_PAGE_SIZE), got $$actual_page_size"; exit 1; \
+	fi
+	$(ANDROID_ADB) shell mkdir -p $(ANDROID_DEVICE_TEST_DIR)
+	$(ANDROID_ADB) push $(ANDROID_RUNTIME_MANUAL_TEST_BIN) $(ANDROID_DEVICE_TEST_DIR)/cardio_android_manual_test
+	$(ANDROID_ADB) shell chmod 755 $(ANDROID_DEVICE_TEST_DIR)/cardio_android_manual_test
+	$(ANDROID_ADB) shell timeout -k 5s 60s $(ANDROID_DEVICE_TEST_DIR)/cardio_android_manual_test
 
 clean:
 	rm -rf $(BUILD_DIR)
