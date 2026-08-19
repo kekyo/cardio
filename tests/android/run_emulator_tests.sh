@@ -30,13 +30,20 @@ android_test_image="system-images;android-$android_test_api;$android_test_tag;$a
 for android_test_tool in \
     "$android_test_sdk_manager" \
     "$android_test_avd_manager" \
-    "$android_test_emulator" \
     "$android_test_adb"; do
     if [ ! -x "$android_test_tool" ]; then
         echo "Required Android tool is not executable: $android_test_tool" >&2
         exit 2
     fi
 done
+
+if [ ! -x "$android_test_emulator" ]; then
+    "$android_test_sdk_manager" --install emulator
+fi
+if [ ! -x "$android_test_emulator" ]; then
+    echo "Required Android tool is not executable: $android_test_emulator" >&2
+    exit 2
+fi
 
 if [ ! -x "$android_test_ndk_root/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang++" ]; then
     echo "Android NDK $android_test_ndk_version is required" >&2
