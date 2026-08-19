@@ -13,6 +13,13 @@ GLIB_LIBS := $(shell $(PKG_CONFIG) --libs glib-2.0 2>/dev/null)
 GIO_AVAILABLE := $(shell $(PKG_CONFIG) --exists "gio-2.0 >= 2.44" 2>/dev/null && echo 1)
 GIO_CFLAGS := $(shell $(PKG_CONFIG) --cflags "gio-2.0 >= 2.44" 2>/dev/null)
 GIO_LIBS := $(shell $(PKG_CONFIG) --libs "gio-2.0 >= 2.44" 2>/dev/null)
+ANDROID_NDK_ROOT ?=
+ANDROID_API ?= 24
+ANDROID_HOST_TAG ?= linux-x86_64
+ANDROID_TOOLCHAIN := $(ANDROID_NDK_ROOT)/toolchains/llvm/prebuilt/$(ANDROID_HOST_TAG)/bin
+ANDROID_X86_64_CXX ?= $(ANDROID_TOOLCHAIN)/x86_64-linux-android$(ANDROID_API)-clang++
+ANDROID_ARM64_CXX ?= $(ANDROID_TOOLCHAIN)/aarch64-linux-android$(ANDROID_API)-clang++
+ANDROID_CXXFLAGS ?= -std=c++20 -Wall -Wextra -Wpedantic -Iinclude
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
@@ -25,6 +32,14 @@ endif
 
 BUILD_DIR := build
 WIN32_BUILD_DIR := $(BUILD_DIR)/win32
+ANDROID_BUILD_DIR := $(BUILD_DIR)/android
+ANDROID_X86_64_BUILD_DIR := $(ANDROID_BUILD_DIR)/x86_64
+ANDROID_ARM64_BUILD_DIR := $(ANDROID_BUILD_DIR)/arm64-v8a
+ANDROID_CONFIG_TEST_SRC := tests/android/cardio_android_config_test.cpp
+ANDROID_POSIX_DISABLED_TEST_SRC := tests/android/cardio_android_posix_disabled_test.cpp
+ANDROID_IO_URING_TEST_SRC := tests/android/cardio_android_io_uring_test.cpp
+ANDROID_X86_64_CONFIG_TEST_OBJ := $(ANDROID_X86_64_BUILD_DIR)/cardio_android_config_test.o
+ANDROID_ARM64_CONFIG_TEST_OBJ := $(ANDROID_ARM64_BUILD_DIR)/cardio_android_config_test.o
 NO_EXCEPTIONS_TEST_SRC := tests/cardio_no_exceptions_test.cpp
 NO_EXCEPTIONS_TEST_BIN := $(BUILD_DIR)/cardio_no_exceptions_test_no_exceptions
 NO_EXCEPTIONS_CXXFLAGS := $(CXXFLAGS) -fno-exceptions
@@ -84,7 +99,7 @@ WIN32_SUPPLEMENTAL_DISABLED_CXXFLAGS := $(WIN32_CXXFLAGS) -DCARDIO_WITH_SUPPLEME
 WIN32_PRIMITIVES_DISABLED_TEST_BIN := $(WIN32_BUILD_DIR)/cardio_primitives_disabled_test_no_primitives.exe
 WIN32_PRIMITIVES_DISABLED_CXXFLAGS := $(WIN32_CXXFLAGS) -DCARDIO_WITH_PRIMITIVES=0
 
-.PHONY: all test test-shared test-win32 test-win32-shared clean
+.PHONY: all test test-shared test-win32 test-win32-shared test-android-config clean
 
 all: $(TEST_BINS) $(NO_EXCEPTIONS_TEST_BIN) $(NO_POSIX_TEST_BIN) $(SUPPLEMENTAL_DISABLED_TEST_BIN) $(PRIMITIVES_DISABLED_TEST_BIN) $(IO_URING_TEST_BINS) $(GLIB_TEST_BINS) $(GIO_TEST_BINS)
 
@@ -93,6 +108,12 @@ $(BUILD_DIR):
 
 $(WIN32_BUILD_DIR):
 	mkdir -p $(WIN32_BUILD_DIR)
+
+$(ANDROID_X86_64_BUILD_DIR):
+	mkdir -p $(ANDROID_X86_64_BUILD_DIR)
+
+$(ANDROID_ARM64_BUILD_DIR):
+	mkdir -p $(ANDROID_ARM64_BUILD_DIR)
 
 $(SHARED_BUILD_DIR):
 	mkdir -p $(SHARED_BUILD_DIR)
@@ -105,6 +126,12 @@ $(BUILD_DIR)/%: tests/%.cpp include/cardio.h tests/test_helpers.h | $(BUILD_DIR)
 
 $(WIN32_BUILD_DIR)/%.exe: tests/%.cpp include/cardio.h tests/test_helpers.h Makefile | $(WIN32_BUILD_DIR)
 	$(WIN32_CXX) $(CXXOPT) $(WIN32_CXXFLAGS) $< -o $@ $(WIN32_LDFLAGS) $(WIN32_LDLIBS)
+
+$(ANDROID_X86_64_CONFIG_TEST_OBJ): $(ANDROID_CONFIG_TEST_SRC) include/cardio.h Makefile | $(ANDROID_X86_64_BUILD_DIR)
+	$(ANDROID_X86_64_CXX) $(CXXOPT) $(ANDROID_CXXFLAGS) -c $< -o $@
+
+$(ANDROID_ARM64_CONFIG_TEST_OBJ): $(ANDROID_CONFIG_TEST_SRC) include/cardio.h Makefile | $(ANDROID_ARM64_BUILD_DIR)
+	$(ANDROID_ARM64_CXX) $(CXXOPT) $(ANDROID_CXXFLAGS) -c $< -o $@
 
 $(NO_EXCEPTIONS_TEST_BIN): $(NO_EXCEPTIONS_TEST_SRC) include/cardio.h tests/test_helpers.h Makefile | $(BUILD_DIR)
 	$(CXX) $(CXXOPT) $(NO_EXCEPTIONS_CXXFLAGS) $< -o $@ $(LDLIBS)
@@ -169,6 +196,40 @@ test-win32-shared: $(WIN32_SHARED_TEST_BIN) $(WIN32_SHARED_PLUGIN) $(WIN32_SHARE
 
 test-win32: $(WIN32_TEST_BINS) $(WIN32_NO_EXCEPTIONS_TEST_BIN) $(WIN32_SUPPLEMENTAL_DISABLED_TEST_BIN) $(WIN32_PRIMITIVES_DISABLED_TEST_BIN) test-win32-shared
 	for test_bin in $(WIN32_TEST_BINS) $(WIN32_NO_EXCEPTIONS_TEST_BIN) $(WIN32_SUPPLEMENTAL_DISABLED_TEST_BIN) $(WIN32_PRIMITIVES_DISABLED_TEST_BIN); do $(WINE) $$test_bin || exit $$?; done
+
+test-android-config: $(ANDROID_X86_64_CONFIG_TEST_OBJ) $(ANDROID_ARM64_CONFIG_TEST_OBJ)
+	@output="$$( $(ANDROID_X86_64_CXX) $(CXXOPT) $(ANDROID_CXXFLAGS) -DCARDIO_HAS_POSIX_FD=0 -fsyntax-only $(ANDROID_POSIX_DISABLED_TEST_SRC) 2>&1 )"; status=$$?; \
+	if [ $$status -eq 0 ]; then \
+		echo "cardio_android_posix_disabled_test (x86_64): FAIL"; exit 1; \
+	elif printf '%s\n' "$$output" | grep -Fq "Android requires CARDIO_HAS_POSIX_FD"; then \
+		echo "cardio_android_posix_disabled_test (x86_64): PASS"; \
+	else \
+		printf '%s\n' "$$output"; echo "cardio_android_posix_disabled_test (x86_64): FAIL"; exit 1; \
+	fi
+	@output="$$( $(ANDROID_ARM64_CXX) $(CXXOPT) $(ANDROID_CXXFLAGS) -DCARDIO_HAS_POSIX_FD=0 -fsyntax-only $(ANDROID_POSIX_DISABLED_TEST_SRC) 2>&1 )"; status=$$?; \
+	if [ $$status -eq 0 ]; then \
+		echo "cardio_android_posix_disabled_test (arm64-v8a): FAIL"; exit 1; \
+	elif printf '%s\n' "$$output" | grep -Fq "Android requires CARDIO_HAS_POSIX_FD"; then \
+		echo "cardio_android_posix_disabled_test (arm64-v8a): PASS"; \
+	else \
+		printf '%s\n' "$$output"; echo "cardio_android_posix_disabled_test (arm64-v8a): FAIL"; exit 1; \
+	fi
+	@output="$$( $(ANDROID_X86_64_CXX) $(CXXOPT) $(ANDROID_CXXFLAGS) -DCARDIO_WITH_LINUX_IO_URING=1 -fsyntax-only $(ANDROID_IO_URING_TEST_SRC) 2>&1 )"; status=$$?; \
+	if [ $$status -eq 0 ]; then \
+		echo "cardio_android_io_uring_test (x86_64): FAIL"; exit 1; \
+	elif printf '%s\n' "$$output" | grep -Fq "CARDIO_WITH_LINUX_IO_URING is not supported on Android"; then \
+		echo "cardio_android_io_uring_test (x86_64): PASS"; \
+	else \
+		printf '%s\n' "$$output"; echo "cardio_android_io_uring_test (x86_64): FAIL"; exit 1; \
+	fi
+	@output="$$( $(ANDROID_ARM64_CXX) $(CXXOPT) $(ANDROID_CXXFLAGS) -DCARDIO_WITH_LINUX_IO_URING=1 -fsyntax-only $(ANDROID_IO_URING_TEST_SRC) 2>&1 )"; status=$$?; \
+	if [ $$status -eq 0 ]; then \
+		echo "cardio_android_io_uring_test (arm64-v8a): FAIL"; exit 1; \
+	elif printf '%s\n' "$$output" | grep -Fq "CARDIO_WITH_LINUX_IO_URING is not supported on Android"; then \
+		echo "cardio_android_io_uring_test (arm64-v8a): PASS"; \
+	else \
+		printf '%s\n' "$$output"; echo "cardio_android_io_uring_test (arm64-v8a): FAIL"; exit 1; \
+	fi
 
 clean:
 	rm -rf $(BUILD_DIR)

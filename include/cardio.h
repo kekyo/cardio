@@ -83,7 +83,7 @@
 #include <stdlib.h>
 
 #ifndef CARDIO_HAS_POSIX_FD
-#if defined(_POSIX_C_SOURCE)
+#if defined(_POSIX_C_SOURCE) || defined(__ANDROID__)
 #define CARDIO_HAS_POSIX_FD 1
 #else
 #define CARDIO_HAS_POSIX_FD 0
@@ -102,12 +102,20 @@
 #error "CARDIO_WITH_GLIB requires CARDIO_HAS_POSIX_FD"
 #endif
 
+#if defined(__ANDROID__) && !CARDIO_HAS_POSIX_FD
+#error "Android requires CARDIO_HAS_POSIX_FD"
+#endif
+
 #if CARDIO_WITH_GIO && !CARDIO_WITH_GLIB
 #error "CARDIO_WITH_GIO requires CARDIO_WITH_GLIB"
 #endif
 
 #if CARDIO_WITH_LINUX_IO_URING && !defined(__linux__)
 #error "CARDIO_WITH_LINUX_IO_URING requires Linux"
+#endif
+
+#if defined(__ANDROID__) && CARDIO_WITH_LINUX_IO_URING
+#error "CARDIO_WITH_LINUX_IO_URING is not supported on Android"
 #endif
 
 #if CARDIO_WITH_LINUX_IO_URING && !CARDIO_HAS_POSIX_FD
@@ -325,6 +333,11 @@ enum class dispatcher_feature : unsigned {
    * C++ exception based failure propagation is available.
    */
   exceptions = 1u << 5,
+
+  /**
+   * Android Looper integration is available.
+   */
+  android = 1u << 6,
 };
 
 /**
@@ -2516,6 +2529,9 @@ private:
 #endif
 #if CARDIO_HAS_EXCEPTIONS
     result |= dispatcher_feature::exceptions;
+#endif
+#if defined(__ANDROID__)
+    result |= dispatcher_feature::android;
 #endif
     return result;
   }
