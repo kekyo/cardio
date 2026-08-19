@@ -17,7 +17,7 @@ if [ -z "$android_ndk_path" ] && [ -n "$android_sdk_path" ]; then
 fi
 
 if [ -x "$android_ndk_path/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang++" ]; then
-    make -j test-android ANDROID_NDK_ROOT="$android_ndk_path"
+    make -j test-android ANDROID_NDK_ROOT="$android_ndk_path" ANDROID_SDK_ROOT="$android_sdk_path"
 else
     echo "Android configuration tests: SKIP (Android NDK 29 not found)"
 fi

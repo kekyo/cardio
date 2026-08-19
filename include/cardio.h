@@ -4524,6 +4524,53 @@ public:
 
 //-----------------------------------------------------------------------------------------------
 
+/**
+ * Dispatches continuations automatically from an existing Android Looper.
+ *
+ * @remarks
+ * The current thread must already own an ALooper, as Java UI threads do. The
+ * host attaches callback-based file descriptor registrations to that Looper
+ * and does not expose park(), so the application keeps ownership of its message
+ * loop. Construction and destruction must occur on the same Looper thread.
+ */
+class dispatcher_host_android_auto final
+    : public internal::dispatcher_host_android_base {
+public:
+  /**
+   * Creates an automatic Android dispatcher host with an implicit group.
+   *
+   * @throws std::system_error Thrown when eventfd or timerfd initialization
+   * fails.
+   * @throws std::runtime_error Thrown when the current thread has no ALooper.
+   */
+  inline dispatcher_host_android_auto()
+      : internal::dispatcher_host_android_base(false) {
+  }
+
+  /**
+   * Creates an automatic Android dispatcher host in an existing group.
+   *
+   * @param group Dispatcher group shared with other dispatchers.
+   * @throws std::system_error Thrown when eventfd or timerfd initialization
+   * fails.
+   * @throws std::runtime_error Thrown when the current thread has no ALooper.
+   */
+  inline explicit dispatcher_host_android_auto(dispatcher_group& group)
+      : internal::dispatcher_host_android_base(group, false) {
+  }
+
+  /**
+   * Detaches the automatic Android dispatcher host on its owner thread.
+   */
+  inline ~dispatcher_host_android_auto() override = default;
+
+  dispatcher_host_android_auto(const dispatcher_host_android_auto&) = delete;
+  dispatcher_host_android_auto& operator=(
+      const dispatcher_host_android_auto&) = delete;
+};
+
+//-----------------------------------------------------------------------------------------------
+
 #endif
 
 //-----------------------------------------------------------------------------------------------

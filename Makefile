@@ -14,14 +14,26 @@ GIO_AVAILABLE := $(shell $(PKG_CONFIG) --exists "gio-2.0 >= 2.44" 2>/dev/null &&
 GIO_CFLAGS := $(shell $(PKG_CONFIG) --cflags "gio-2.0 >= 2.44" 2>/dev/null)
 GIO_LIBS := $(shell $(PKG_CONFIG) --libs "gio-2.0 >= 2.44" 2>/dev/null)
 ANDROID_NDK_ROOT ?=
+ANDROID_SDK_ROOT ?=
 ANDROID_API ?= 24
 ANDROID_HOST_TAG ?= linux-x86_64
+ANDROID_BUILD_TOOLS_VERSION ?= 36.0.0
+ANDROID_PLATFORM_VERSION ?= 37.0
 ANDROID_TOOLCHAIN := $(ANDROID_NDK_ROOT)/toolchains/llvm/prebuilt/$(ANDROID_HOST_TAG)/bin
+ANDROID_BUILD_TOOLS := $(ANDROID_SDK_ROOT)/build-tools/$(ANDROID_BUILD_TOOLS_VERSION)
+ANDROID_PLATFORM_JAR := $(ANDROID_SDK_ROOT)/platforms/android-$(ANDROID_PLATFORM_VERSION)/android.jar
 ANDROID_X86_64_CXX ?= $(ANDROID_TOOLCHAIN)/x86_64-linux-android$(ANDROID_API)-clang++
 ANDROID_ARM64_CXX ?= $(ANDROID_TOOLCHAIN)/aarch64-linux-android$(ANDROID_API)-clang++
 ANDROID_CXXFLAGS ?= -std=c++20 -Wall -Wextra -Wpedantic -pthread -Iinclude -Itests
 ANDROID_LDFLAGS ?= -static-libstdc++ -Wl,-z,max-page-size=16384
 ANDROID_LDLIBS ?= -landroid
+ANDROID_AAPT2 ?= $(ANDROID_BUILD_TOOLS)/aapt2
+ANDROID_D8 ?= $(ANDROID_BUILD_TOOLS)/d8
+ANDROID_ZIPALIGN ?= $(ANDROID_BUILD_TOOLS)/zipalign
+ANDROID_APKSIGNER ?= $(ANDROID_BUILD_TOOLS)/apksigner
+JAVAC ?= javac
+KEYTOOL ?= keytool
+ZIP ?= zip
 ADB ?= adb
 ADB_SERIAL ?=
 ANDROID_RUNTIME_ABI ?= x86_64
@@ -48,14 +60,30 @@ ANDROID_CONFIG_TEST_SRC := tests/android/cardio_android_config_test.cpp
 ANDROID_POSIX_DISABLED_TEST_SRC := tests/android/cardio_android_posix_disabled_test.cpp
 ANDROID_IO_URING_TEST_SRC := tests/android/cardio_android_io_uring_test.cpp
 ANDROID_MANUAL_TEST_SRC := tests/android/cardio_android_manual_test.cpp
+ANDROID_AUTO_TEST_SRC := tests/android/cardio_android_auto_test.cpp
+ANDROID_APP_SRC_DIR := tests/android/app
+ANDROID_APP_MANIFEST := $(ANDROID_APP_SRC_DIR)/AndroidManifest.xml
+ANDROID_APP_JAVA_SRCS := $(ANDROID_APP_SRC_DIR)/src/com/example/cardio/CardioActivity.java $(ANDROID_APP_SRC_DIR)/src/com/example/cardio/CardioInstrumentation.java
+ANDROID_APP_BUILD_DIR := $(ANDROID_BUILD_DIR)/app
+ANDROID_APP_CLASSES_DIR := $(ANDROID_APP_BUILD_DIR)/classes
+ANDROID_APP_CLASSES_STAMP := $(ANDROID_APP_CLASSES_DIR)/.stamp
+ANDROID_APP_DEX_DIR := $(ANDROID_APP_BUILD_DIR)/dex
+ANDROID_APP_DEX := $(ANDROID_APP_DEX_DIR)/classes.dex
+ANDROID_APP_KEYSTORE := $(ANDROID_APP_BUILD_DIR)/debug.keystore
 ANDROID_X86_64_CONFIG_TEST_OBJ := $(ANDROID_X86_64_BUILD_DIR)/cardio_android_config_test.o
 ANDROID_ARM64_CONFIG_TEST_OBJ := $(ANDROID_ARM64_BUILD_DIR)/cardio_android_config_test.o
 ANDROID_X86_64_MANUAL_TEST_BIN := $(ANDROID_X86_64_BUILD_DIR)/cardio_android_manual_test
 ANDROID_ARM64_MANUAL_TEST_BIN := $(ANDROID_ARM64_BUILD_DIR)/cardio_android_manual_test
+ANDROID_X86_64_AUTO_TEST_LIB := $(ANDROID_X86_64_BUILD_DIR)/libcardio_android_auto_test.so
+ANDROID_ARM64_AUTO_TEST_LIB := $(ANDROID_ARM64_BUILD_DIR)/libcardio_android_auto_test.so
+ANDROID_X86_64_AUTO_TEST_APK := $(ANDROID_X86_64_BUILD_DIR)/cardio_android_auto_test.apk
+ANDROID_ARM64_AUTO_TEST_APK := $(ANDROID_ARM64_BUILD_DIR)/cardio_android_auto_test.apk
 ifeq ($(ANDROID_RUNTIME_ABI),x86_64)
 ANDROID_RUNTIME_MANUAL_TEST_BIN := $(ANDROID_X86_64_MANUAL_TEST_BIN)
+ANDROID_RUNTIME_AUTO_TEST_APK := $(ANDROID_X86_64_AUTO_TEST_APK)
 else ifeq ($(ANDROID_RUNTIME_ABI),arm64-v8a)
 ANDROID_RUNTIME_MANUAL_TEST_BIN := $(ANDROID_ARM64_MANUAL_TEST_BIN)
+ANDROID_RUNTIME_AUTO_TEST_APK := $(ANDROID_ARM64_AUTO_TEST_APK)
 else
 $(error Unsupported ANDROID_RUNTIME_ABI: $(ANDROID_RUNTIME_ABI))
 endif
@@ -158,6 +186,45 @@ $(ANDROID_X86_64_MANUAL_TEST_BIN): $(ANDROID_MANUAL_TEST_SRC) include/cardio.h t
 $(ANDROID_ARM64_MANUAL_TEST_BIN): $(ANDROID_MANUAL_TEST_SRC) include/cardio.h tests/test_helpers.h Makefile | $(ANDROID_ARM64_BUILD_DIR)
 	$(ANDROID_ARM64_CXX) $(CXXOPT) $(ANDROID_CXXFLAGS) $< -o $@ $(ANDROID_LDFLAGS) $(ANDROID_LDLIBS)
 
+$(ANDROID_X86_64_AUTO_TEST_LIB): $(ANDROID_AUTO_TEST_SRC) include/cardio.h Makefile | $(ANDROID_X86_64_BUILD_DIR)
+	$(ANDROID_X86_64_CXX) $(CXXOPT) $(ANDROID_CXXFLAGS) -fPIC -shared $< -o $@ $(ANDROID_LDFLAGS) $(ANDROID_LDLIBS)
+
+$(ANDROID_ARM64_AUTO_TEST_LIB): $(ANDROID_AUTO_TEST_SRC) include/cardio.h Makefile | $(ANDROID_ARM64_BUILD_DIR)
+	$(ANDROID_ARM64_CXX) $(CXXOPT) $(ANDROID_CXXFLAGS) -fPIC -shared $< -o $@ $(ANDROID_LDFLAGS) $(ANDROID_LDLIBS)
+
+$(ANDROID_APP_CLASSES_STAMP): $(ANDROID_APP_JAVA_SRCS) $(ANDROID_APP_MANIFEST) Makefile
+	mkdir -p $(ANDROID_APP_CLASSES_DIR)
+	$(JAVAC) --release 8 -Xlint:-options -classpath $(ANDROID_PLATFORM_JAR) -d $(ANDROID_APP_CLASSES_DIR) $(ANDROID_APP_JAVA_SRCS)
+	touch $@
+
+$(ANDROID_APP_DEX): $(ANDROID_APP_CLASSES_STAMP)
+	mkdir -p $(ANDROID_APP_DEX_DIR)
+	$(ANDROID_D8) --min-api 24 --lib $(ANDROID_PLATFORM_JAR) --output $(ANDROID_APP_DEX_DIR) $$(find $(ANDROID_APP_CLASSES_DIR) -name '*.class' -print)
+
+$(ANDROID_APP_KEYSTORE):
+	mkdir -p $(ANDROID_APP_BUILD_DIR)
+	$(KEYTOOL) -genkeypair -noprompt -keystore $@ -storetype PKCS12 -storepass android -keypass android -alias androiddebugkey -dname "CN=Android Debug,O=Android,C=US" -keyalg RSA -validity 10000
+
+$(ANDROID_X86_64_AUTO_TEST_APK): $(ANDROID_X86_64_AUTO_TEST_LIB) $(ANDROID_APP_DEX) $(ANDROID_APP_KEYSTORE) $(ANDROID_APP_MANIFEST) Makefile
+	mkdir -p $(ANDROID_X86_64_BUILD_DIR)/app-staging/lib/x86_64
+	$(ANDROID_AAPT2) link -I $(ANDROID_PLATFORM_JAR) --manifest $(ANDROID_APP_MANIFEST) -o $(ANDROID_X86_64_BUILD_DIR)/app-staging/base.apk
+	cp $(ANDROID_APP_DEX) $(ANDROID_X86_64_BUILD_DIR)/app-staging/classes.dex
+	cp $(ANDROID_X86_64_AUTO_TEST_LIB) $(ANDROID_X86_64_BUILD_DIR)/app-staging/lib/x86_64/libcardio_android_auto_test.so
+	cd $(ANDROID_X86_64_BUILD_DIR)/app-staging && $(ZIP) -q -0 base.apk classes.dex lib/x86_64/libcardio_android_auto_test.so
+	$(ANDROID_ZIPALIGN) -P 16 -f 4 $(ANDROID_X86_64_BUILD_DIR)/app-staging/base.apk $(ANDROID_X86_64_BUILD_DIR)/app-staging/aligned.apk
+	$(ANDROID_APKSIGNER) sign --ks $(ANDROID_APP_KEYSTORE) --ks-pass pass:android --key-pass pass:android --out $@ $(ANDROID_X86_64_BUILD_DIR)/app-staging/aligned.apk
+	$(ANDROID_APKSIGNER) verify $@
+
+$(ANDROID_ARM64_AUTO_TEST_APK): $(ANDROID_ARM64_AUTO_TEST_LIB) $(ANDROID_APP_DEX) $(ANDROID_APP_KEYSTORE) $(ANDROID_APP_MANIFEST) Makefile
+	mkdir -p $(ANDROID_ARM64_BUILD_DIR)/app-staging/lib/arm64-v8a
+	$(ANDROID_AAPT2) link -I $(ANDROID_PLATFORM_JAR) --manifest $(ANDROID_APP_MANIFEST) -o $(ANDROID_ARM64_BUILD_DIR)/app-staging/base.apk
+	cp $(ANDROID_APP_DEX) $(ANDROID_ARM64_BUILD_DIR)/app-staging/classes.dex
+	cp $(ANDROID_ARM64_AUTO_TEST_LIB) $(ANDROID_ARM64_BUILD_DIR)/app-staging/lib/arm64-v8a/libcardio_android_auto_test.so
+	cd $(ANDROID_ARM64_BUILD_DIR)/app-staging && $(ZIP) -q -0 base.apk classes.dex lib/arm64-v8a/libcardio_android_auto_test.so
+	$(ANDROID_ZIPALIGN) -P 16 -f 4 $(ANDROID_ARM64_BUILD_DIR)/app-staging/base.apk $(ANDROID_ARM64_BUILD_DIR)/app-staging/aligned.apk
+	$(ANDROID_APKSIGNER) sign --ks $(ANDROID_APP_KEYSTORE) --ks-pass pass:android --key-pass pass:android --out $@ $(ANDROID_ARM64_BUILD_DIR)/app-staging/aligned.apk
+	$(ANDROID_APKSIGNER) verify $@
+
 $(NO_EXCEPTIONS_TEST_BIN): $(NO_EXCEPTIONS_TEST_SRC) include/cardio.h tests/test_helpers.h Makefile | $(BUILD_DIR)
 	$(CXX) $(CXXOPT) $(NO_EXCEPTIONS_CXXFLAGS) $< -o $@ $(LDLIBS)
 
@@ -256,7 +323,7 @@ test-android-config: $(ANDROID_X86_64_CONFIG_TEST_OBJ) $(ANDROID_ARM64_CONFIG_TE
 		printf '%s\n' "$$output"; echo "cardio_android_io_uring_test (arm64-v8a): FAIL"; exit 1; \
 	fi
 
-test-android: test-android-config $(ANDROID_X86_64_MANUAL_TEST_BIN) $(ANDROID_ARM64_MANUAL_TEST_BIN)
+test-android: test-android-config $(ANDROID_X86_64_MANUAL_TEST_BIN) $(ANDROID_ARM64_MANUAL_TEST_BIN) $(ANDROID_X86_64_AUTO_TEST_APK) $(ANDROID_ARM64_AUTO_TEST_APK)
 
 test-android-runtime: test-android $(ANDROID_RUNTIME_MANUAL_TEST_BIN)
 	@if [ -z "$(ANDROID_EXPECTED_API)" ]; then \
@@ -281,6 +348,12 @@ test-android-runtime: test-android $(ANDROID_RUNTIME_MANUAL_TEST_BIN)
 	$(ANDROID_ADB) push $(ANDROID_RUNTIME_MANUAL_TEST_BIN) $(ANDROID_DEVICE_TEST_DIR)/cardio_android_manual_test
 	$(ANDROID_ADB) shell chmod 755 $(ANDROID_DEVICE_TEST_DIR)/cardio_android_manual_test
 	$(ANDROID_ADB) shell timeout -k 5s 60s $(ANDROID_DEVICE_TEST_DIR)/cardio_android_manual_test
+	$(ANDROID_ADB) install -r $(ANDROID_RUNTIME_AUTO_TEST_APK)
+	@output="$$( $(ANDROID_ADB) shell am instrument -w com.example.cardio/.CardioInstrumentation 2>&1 )"; status=$$?; \
+	printf '%s\n' "$$output"; \
+	if [ $$status -ne 0 ] || ! printf '%s\n' "$$output" | grep -Fq "cardio_android_auto_test: PASS"; then \
+		exit 1; \
+	fi
 
 clean:
 	rm -rf $(BUILD_DIR)

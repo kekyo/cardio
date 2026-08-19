@@ -318,6 +318,21 @@ static void park_rejects_non_owner_thread() {
   CHECK(rejected.load(std::memory_order_acquire));
 }
 
+static void automatic_host_requires_existing_looper() {
+  auto rejected = std::atomic<bool>{false};
+  auto worker = std::thread([&] {
+    CHECK(ALooper_forThread() == nullptr);
+    try {
+      cardio::dispatcher_host_android_auto dispatcher;
+    } catch (const std::runtime_error&) {
+      rejected.store(true, std::memory_order_release);
+    }
+  });
+
+  worker.join();
+  CHECK(rejected.load(std::memory_order_acquire));
+}
+
 static void repeated_host_lifecycle_preserves_looper() {
   for (auto iteration = 0; iteration < 32; ++iteration) {
     cardio::dispatcher_host_android dispatcher;
@@ -343,6 +358,7 @@ int main() {
   gentle_shutdown_collects_already_ready_fd();
   immediate_shutdown_skips_remaining_work();
   park_rejects_non_owner_thread();
+  automatic_host_requires_existing_looper();
   repeated_host_lifecycle_preserves_looper();
 
   std::puts("cardio_android_manual_test: PASS");
