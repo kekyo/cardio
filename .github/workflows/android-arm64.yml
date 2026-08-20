@@ -1,0 +1,66 @@
+name: Android arm64 device
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_api:
+        description: Android API level reported by the attached device
+        required: true
+        default: "35"
+        type: string
+      expected_page_size:
+        description: Memory page size reported by the attached device
+        required: true
+        default: "16384"
+        type: choice
+        options:
+          - "16384"
+          - "4096"
+      adb_serial:
+        description: adb serial, or empty when exactly one device is attached
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.expected_api }}-${{ inputs.expected_page_size }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: arm64-v8a / API ${{ inputs.expected_api }} / ${{ inputs.expected_page_size }} bytes
+    runs-on: [self-hosted, linux, android-arm64]
+    timeout-minutes: 30
+    env:
+      ADB_SERIAL: ${{ inputs.adb_serial }}
+      EXPECTED_API: ${{ inputs.expected_api }}
+      EXPECTED_PAGE_SIZE: ${{ inputs.expected_page_size }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify Android toolchain and device
+        run: |
+          test -n "$ANDROID_SDK_ROOT"
+          test -n "$ANDROID_NDK_ROOT"
+          test -x "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+          if [ -n "$ADB_SERIAL" ]; then
+            adb -s "$ADB_SERIAL" get-state
+          else
+            adb get-state
+          fi
+
+      - name: Run Android arm64 tests
+        run: |
+          make -j test-android-runtime \
+            ANDROID_NDK_ROOT="$ANDROID_NDK_ROOT" \
+            ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" \
+            ANDROID_RUNTIME_ABI=arm64-v8a \
+            ANDROID_EXPECTED_API="$EXPECTED_API" \
+            ANDROID_EXPECTED_PAGE_SIZE="$EXPECTED_PAGE_SIZE" \
+            ADB_SERIAL="$ADB_SERIAL"
