@@ -3,6 +3,9 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
 
 permissions:
   contents: read
@@ -37,7 +40,9 @@ jobs:
             pkg-config \
             wine \
             wine64 \
-            xvfb
+            xvfb \
+            zip \
+            unzip
 
       - name: Verify dependencies
         run: |
@@ -54,8 +59,92 @@ jobs:
 
       - name: Build and test
         env:
+          ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/29.0.14206865
           WINEPREFIX: ${{ runner.temp }}/cardio-wine
         run: xvfb-run --auto-servernum ./build.sh
 
       - name: Analyze with CodeQL
         uses: github/codeql-action/analyze@v4
+
+  android-runtime:
+    name: Android runtime (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: API 24 / 4 KiB
+            api: 24
+            image_tag: google_apis
+            page_size: 4096
+          - name: API 35 / 16 KiB
+            api: 35
+            image_tag: google_apis_ps16k
+            page_size: 16384
+    env:
+      ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/29.0.14206865
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache Android emulator
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /usr/local/lib/android/sdk/emulator
+          key: android-emulator-${{ runner.os }}-v1
+
+      - name: Cache Android system image
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /usr/local/lib/android/sdk/system-images/android-${{ matrix.api }}/${{ matrix.image_tag }}/x86_64
+          key: android-system-image-${{ runner.os }}-${{ matrix.api }}-${{ matrix.image_tag }}-x86_64-v1
+
+      - name: Enable KVM
+        run: |
+          test -e /dev/kvm
+          sudo chmod 666 /dev/kvm
+
+      - name: Run Android tests
+        run: >-
+          tests/android/run_emulator_tests.sh
+          ${{ matrix.api }}
+          ${{ matrix.image_tag }}
+          ${{ matrix.page_size }}
+
+  android-runtime-api35-4k:
+    name: Android runtime (API 35 / 4 KiB, extended)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/29.0.14206865
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache Android emulator
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /usr/local/lib/android/sdk/emulator
+          key: android-emulator-${{ runner.os }}-v1
+
+      - name: Cache Android system image
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /usr/local/lib/android/sdk/system-images/android-35/google_apis/x86_64
+          key: android-system-image-${{ runner.os }}-35-google_apis-x86_64-v1
+
+      - name: Enable KVM
+        run: |
+          test -e /dev/kvm
+          sudo chmod 666 /dev/kvm
+
+      - name: Run Android tests
+        run: tests/android/run_emulator_tests.sh 35 google_apis 4096
