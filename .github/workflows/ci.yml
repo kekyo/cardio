@@ -4,6 +4,21 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      android_test_target:
+        description: Android test driver
+        type: choice
+        default: test-android-runtime
+        options:
+          - test-android-runtime
+          - test-android-control
+      android_16k_api:
+        description: 16 KiB image (API 35 is retained for crash diagnosis)
+        type: choice
+        default: "36"
+        options:
+          - "36"
+          - "35"
   schedule:
     - cron: "17 3 * * 1"
 
@@ -12,12 +27,53 @@ permissions:
   security-events: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.android_test_target || 'test-android-runtime' }}-${{ inputs.android_16k_api || '36' }}
   cancel-in-progress: true
 
+env:
+  # Android CLI supports installing an exact emulator revision with SDK metadata.
+  ANDROID_COMMAND_LINE_TOOLS_REVISION: "23.0"
+  ANDROID_EMULATOR_REVISION: "37.2.12"
+
 jobs:
+  windows-xp:
+    name: Windows XP targets (GCC 12)
+    if: inputs.android_test_target != 'test-android-control'
+    runs-on: ubuntu-24.04
+    container: debian:12
+    timeout-minutes: 20
+    env:
+      WINEDEBUG: "-all"
+      WINEPREFIX: /tmp/cardio-xp-wine
+    steps:
+      - name: Install GCC 12 and Wine
+        run: |
+          dpkg --add-architecture i386
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            ca-certificates git make nodejs \
+            g++-mingw-w64-x86-64-win32 g++-mingw-w64-i686-win32 \
+            wine wine64 wine32:i386 xvfb xauth
+          test "$(x86_64-w64-mingw32-g++-win32 -dumpversion)" = 12-win32
+          test "$(i686-w64-mingw32-g++-win32 -dumpversion)" = 12-win32
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build compatibility drivers
+        run: >-
+          make -C tests/windows -j2 all
+          AMD64_CXX=x86_64-w64-mingw32-g++-win32
+          I686_CXX=i686-w64-mingw32-g++-win32
+
+      - name: Verify both cancellation paths and imports
+        run: xvfb-run --auto-servernum make test-win32-xp
+
   build-and-test:
     name: Build and test
+    if: inputs.android_test_target != 'test-android-control'
     runs-on: ubuntu-24.04
     env:
       WINEARCH: win64
@@ -77,14 +133,19 @@ jobs:
           - name: API 24 / 4 KiB
             api: 24
             image_tag: google_apis
+            image_revision: 27
             page_size: 4096
-          - name: API 35 / 16 KiB
-            api: 35
+          - name: API ${{ inputs.android_16k_api || '36' }} / 16 KiB
+            api: ${{ inputs.android_16k_api || '36' }}
             image_tag: google_apis_ps16k
+            image_revision: ${{ inputs.android_16k_api == '35' && '5' || '7' }}
             page_size: 16384
     env:
       ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/29.0.14206865
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      ANDROID_TEST_DIAGNOSTICS_DIR: ${{ github.workspace }}/build/android/diagnostics
+      ANDROID_TEST_TARGET: ${{ inputs.android_test_target || 'test-android-runtime' }}
+      ANDROID_IMAGE_REVISION: ${{ matrix.image_revision }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -92,16 +153,27 @@ jobs:
           persist-credentials: false
 
       - name: Cache Android emulator
+        id: emulator-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: /usr/local/lib/android/sdk/emulator
-          key: android-emulator-${{ runner.os }}-v1
+          path: |
+            /usr/local/lib/android/sdk/emulator
+            /usr/local/lib/android/sdk/cmdline-tools/${{ env.ANDROID_COMMAND_LINE_TOOLS_REVISION }}
+          key: android-emulator-${{ runner.os }}-${{ env.ANDROID_EMULATOR_REVISION }}-cli${{ env.ANDROID_COMMAND_LINE_TOOLS_REVISION }}-v3
+
+      - name: Install pinned Android emulator
+        if: steps.emulator-cache.outputs.cache-hit != 'true'
+        run: |
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            --install "cmdline-tools;$ANDROID_COMMAND_LINE_TOOLS_REVISION"
+          "$ANDROID_SDK_ROOT/cmdline-tools/$ANDROID_COMMAND_LINE_TOOLS_REVISION/bin/android" \
+            --no-metrics --sdk="$ANDROID_SDK_ROOT" sdk install --force "emulator@$ANDROID_EMULATOR_REVISION"
 
       - name: Cache Android system image
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /usr/local/lib/android/sdk/system-images/android-${{ matrix.api }}/${{ matrix.image_tag }}/x86_64
-          key: android-system-image-${{ runner.os }}-${{ matrix.api }}-${{ matrix.image_tag }}-x86_64-v1
+          key: android-system-image-${{ runner.os }}-${{ matrix.api }}-${{ matrix.image_tag }}-x86_64-r${{ matrix.image_revision }}-v2
 
       - name: Enable KVM
         run: |
@@ -109,11 +181,21 @@ jobs:
           sudo chmod 666 /dev/kvm
 
       - name: Run Android tests
-        run: >-
-          tests/android/run_emulator_tests.sh
-          ${{ matrix.api }}
-          ${{ matrix.image_tag }}
-          ${{ matrix.page_size }}
+        run: |
+          for cold_boot in 1 2 3; do
+            echo "Cold boot $cold_boot of 3"
+            tests/android/run_emulator_tests.sh \
+              ${{ matrix.api }} ${{ matrix.image_tag }} ${{ matrix.page_size }}
+          done
+
+      - name: Upload Android diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-diagnostics-api${{ matrix.api }}-${{ matrix.image_tag }}
+          path: ${{ env.ANDROID_TEST_DIAGNOSTICS_DIR }}
+          retention-days: 14
+          if-no-files-found: warn
 
   android-runtime-api35-4k:
     name: Android runtime (API 35 / 4 KiB, extended)
@@ -123,6 +205,9 @@ jobs:
     env:
       ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/29.0.14206865
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      ANDROID_TEST_DIAGNOSTICS_DIR: ${{ github.workspace }}/build/android/diagnostics
+      ANDROID_TEST_TARGET: ${{ inputs.android_test_target || 'test-android-runtime' }}
+      ANDROID_IMAGE_REVISION: "9"
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -130,16 +215,27 @@ jobs:
           persist-credentials: false
 
       - name: Cache Android emulator
+        id: emulator-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: /usr/local/lib/android/sdk/emulator
-          key: android-emulator-${{ runner.os }}-v1
+          path: |
+            /usr/local/lib/android/sdk/emulator
+            /usr/local/lib/android/sdk/cmdline-tools/${{ env.ANDROID_COMMAND_LINE_TOOLS_REVISION }}
+          key: android-emulator-${{ runner.os }}-${{ env.ANDROID_EMULATOR_REVISION }}-cli${{ env.ANDROID_COMMAND_LINE_TOOLS_REVISION }}-v3
+
+      - name: Install pinned Android emulator
+        if: steps.emulator-cache.outputs.cache-hit != 'true'
+        run: |
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            --install "cmdline-tools;$ANDROID_COMMAND_LINE_TOOLS_REVISION"
+          "$ANDROID_SDK_ROOT/cmdline-tools/$ANDROID_COMMAND_LINE_TOOLS_REVISION/bin/android" \
+            --no-metrics --sdk="$ANDROID_SDK_ROOT" sdk install --force "emulator@$ANDROID_EMULATOR_REVISION"
 
       - name: Cache Android system image
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /usr/local/lib/android/sdk/system-images/android-35/google_apis/x86_64
-          key: android-system-image-${{ runner.os }}-35-google_apis-x86_64-v1
+          key: android-system-image-${{ runner.os }}-35-google_apis-x86_64-r${{ env.ANDROID_IMAGE_REVISION }}-v2
 
       - name: Enable KVM
         run: |
@@ -147,4 +243,17 @@ jobs:
           sudo chmod 666 /dev/kvm
 
       - name: Run Android tests
-        run: tests/android/run_emulator_tests.sh 35 google_apis 4096
+        run: |
+          for cold_boot in 1 2 3; do
+            echo "Cold boot $cold_boot of 3"
+            tests/android/run_emulator_tests.sh 35 google_apis 4096
+          done
+
+      - name: Upload Android diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-diagnostics-api35-google_apis
+          path: ${{ env.ANDROID_TEST_DIAGNOSTICS_DIR }}
+          retention-days: 14
+          if-no-files-found: warn

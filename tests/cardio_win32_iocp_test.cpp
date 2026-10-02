@@ -404,6 +404,7 @@ static void start_failure_is_rejected() {
       [](HANDLE, OVERLAPPED&) {
         return static_cast<DWORD>(ERROR_ACCESS_DENIED);
       });
+  dispatcher.park();
   CHECK(promise.is_ready());
 
   auto caught = false;
