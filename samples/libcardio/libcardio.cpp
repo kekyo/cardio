@@ -22,4 +22,10 @@ namespace cardio::internal {
     thread_local runtime_thread_state state;
     return state;
   }
+#if CARDIO_HAS_WIN32_HANDLE
+  CARDIO_API win32_legacy_io_registry& legacy_io_registry() {
+    static win32_legacy_io_registry registry;
+    return registry;
+  }
+#endif
 }
