@@ -70,7 +70,7 @@
 #endif
 #endif
 
-#if CARDIO_HAS_WIN32_HANDLE
+#if defined(_WIN32) || CARDIO_HAS_WIN32_HANDLE
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -78,6 +78,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <process.h>
 #endif
 
 #include <stdlib.h>
@@ -157,9 +158,7 @@
 #include <utility>
 #include <vector>
 
-#if CARDIO_HAS_NATIVE_WAIT || CARDIO_WITH_SUPPLEMENTAL
 #include <thread>
-#endif
 
 #if CARDIO_WITH_SUPPLEMENTAL
 #include <chrono>
@@ -195,6 +194,198 @@
 #endif
 
 namespace cardio {
+
+//-----------------------------------------------------------------------------------------------
+
+namespace internal {
+#if defined(_WIN32)
+  // MinGW's win32 thread model before GCC 13 has no C++ threading classes.
+  // Use XP primitives even when native handle waits are disabled.
+  [[noreturn]] inline void fail_thread_error(DWORD error) {
+#if CARDIO_HAS_EXCEPTIONS
+    throw std::system_error(
+        static_cast<int>(error), std::system_category(),
+        "cardio: Windows threading operation failed");
+#else
+    (void)error;
+    std::terminate();
+#endif
+  }
+
+  class mutex {
+  private:
+    CRITICAL_SECTION section_{};
+
+  public:
+    inline mutex() {
+      if (::InitializeCriticalSectionAndSpinCount(&section_, 0) == 0) {
+        fail_thread_error(::GetLastError());
+      }
+    }
+    inline ~mutex() { ::DeleteCriticalSection(&section_); }
+    inline void lock() noexcept { ::EnterCriticalSection(&section_); }
+    inline void unlock() noexcept { ::LeaveCriticalSection(&section_); }
+    mutex(const mutex&) = delete;
+    mutex& operator=(const mutex&) = delete;
+  };
+
+  class condition_variable {
+  private:
+    struct waiter {
+      HANDLE event;
+      waiter* next;
+    };
+    mutex mutex_;
+    waiter* waiters_ = nullptr;
+
+    inline void wait_for(std::unique_lock<mutex>& lock, DWORD timeout) {
+      auto entry = waiter{::CreateEventW(nullptr, FALSE, FALSE, nullptr), nullptr};
+      if (entry.event == nullptr) {
+        fail_thread_error(::GetLastError());
+      }
+      {
+        auto guard = std::lock_guard<mutex>(mutex_);
+        entry.next = waiters_;
+        waiters_ = &entry;
+      }
+      lock.unlock();
+      const auto result = ::WaitForSingleObject(entry.event, timeout);
+      const auto error = result == WAIT_FAILED ? ::GetLastError() : ERROR_SUCCESS;
+      {
+        // Unlink before closing the event, including when a timeout races a
+        // notifier. SetEvent also runs under this lock, so it cannot use a
+        // closed event. Each waiter has its own notification to avoid stealing
+        // wakeups or losing a broadcast during mutex reacquisition.
+        auto guard = std::lock_guard<mutex>(mutex_);
+        auto** current = &waiters_;
+        while (*current != nullptr && *current != &entry) {
+          current = &(*current)->next;
+        }
+        if (*current == &entry) {
+          *current = entry.next;
+        }
+        (void)::CloseHandle(entry.event);
+      }
+      lock.lock();
+      if (error != ERROR_SUCCESS) {
+        fail_thread_error(error);
+      }
+    }
+
+  public:
+    inline void notify_one() noexcept {
+      auto guard = std::lock_guard<mutex>(mutex_);
+      if (waiters_ != nullptr) {
+        auto* entry = waiters_;
+        waiters_ = entry->next;
+        if (::SetEvent(entry->event) == 0) {
+          std::terminate();
+        }
+      }
+    }
+    inline void notify_all() noexcept {
+      auto guard = std::lock_guard<mutex>(mutex_);
+      while (waiters_ != nullptr) {
+        auto* entry = waiters_;
+        waiters_ = entry->next;
+        if (::SetEvent(entry->event) == 0) {
+          std::terminate();
+        }
+      }
+    }
+    template <typename Predicate>
+    inline void wait(std::unique_lock<mutex>& lock, Predicate predicate) {
+      while (!predicate()) {
+        wait_for(lock, INFINITE);
+      }
+    }
+    inline void wait_until(
+        std::unique_lock<mutex>& lock,
+        std::chrono::steady_clock::time_point deadline) {
+      const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+          deadline - std::chrono::steady_clock::now()).count();
+      const auto timeout = remaining <= 0 ? DWORD{0} :
+          remaining >= INFINITE ? INFINITE - 1 : static_cast<DWORD>(remaining);
+      wait_for(lock, timeout);
+    }
+  };
+
+  class thread {
+  private:
+    HANDLE handle_ = nullptr;
+    unsigned id_ = 0;
+
+    template <typename Function>
+    static unsigned __stdcall run(void* argument) noexcept {
+      auto function = std::unique_ptr<Function>(static_cast<Function*>(argument));
+      std::invoke(*function);
+      return 0;
+    }
+
+  public:
+    using id = DWORD;
+    inline thread() noexcept = default;
+    template <typename Function>
+    inline explicit thread(Function&& function) {
+      using function_type = std::decay_t<Function>;
+      auto owned = std::make_unique<function_type>(std::forward<Function>(function));
+      handle_ = reinterpret_cast<HANDLE>(::_beginthreadex(
+          nullptr, 0, &run<function_type>, owned.get(), 0, &id_));
+      if (handle_ == nullptr) {
+        fail_thread_error(ERROR_NOT_ENOUGH_MEMORY);
+      }
+      (void)owned.release();
+    }
+    inline thread(thread&& other) noexcept
+        : handle_(std::exchange(other.handle_, nullptr)),
+          id_(std::exchange(other.id_, 0)) {}
+    inline thread& operator=(thread&& other) noexcept {
+      if (joinable()) {
+        std::terminate();
+      }
+      handle_ = std::exchange(other.handle_, nullptr);
+      id_ = std::exchange(other.id_, 0);
+      return *this;
+    }
+    inline ~thread() {
+      if (joinable()) {
+        std::terminate();
+      }
+    }
+    inline bool joinable() const noexcept { return handle_ != nullptr; }
+    inline void join() {
+      if (!joinable() || id_ == ::GetCurrentThreadId()) {
+        fail_thread_error(ERROR_INVALID_PARAMETER);
+      }
+      if (::WaitForSingleObject(handle_, INFINITE) != WAIT_OBJECT_0) {
+        fail_thread_error(::GetLastError());
+      }
+      detach();
+    }
+    inline void detach() {
+      if (!joinable()) {
+        fail_thread_error(ERROR_INVALID_HANDLE);
+      }
+      (void)::CloseHandle(handle_);
+      handle_ = nullptr;
+      id_ = 0;
+    }
+    thread(const thread&) = delete;
+    thread& operator=(const thread&) = delete;
+  };
+
+  inline thread::id current_thread_id() noexcept {
+    return ::GetCurrentThreadId();
+  }
+#else
+  using mutex = std::mutex;
+  using condition_variable = std::condition_variable;
+  using thread = std::thread;
+  inline thread::id current_thread_id() noexcept {
+    return std::this_thread::get_id();
+  }
+#endif
+}  // namespace internal
 
 //-----------------------------------------------------------------------------------------------
 
@@ -291,6 +482,16 @@ enum class park_policy {
    * messages.
    */
   continuation_first,
+};
+
+/**
+ * Controls which threads may execute a manual dispatcher host.
+ */
+enum class dispatcher_thread_policy {
+  /** Allow any thread to park the dispatcher. */
+  any_thread,
+  /** Only the constructing thread may park the dispatcher. */
+  current_thread,
 };
 
 /**
@@ -801,7 +1002,7 @@ namespace internal {
   };
 
   struct cancellation_state {
-    std::mutex mutex;
+    ::cardio::internal::mutex mutex;
     bool cancellation_requested = false;
     cancellation_callback_entry* callbacks = nullptr;
     std::vector<cancellation_registration> retained_registrations;
@@ -861,7 +1062,7 @@ namespace internal {
 #endif
 
   struct dispatcher_group_lifetime {
-    std::mutex mutex;
+    ::cardio::internal::mutex mutex;
     dispatcher_group* group;
 
     inline explicit dispatcher_group_lifetime(
@@ -872,7 +1073,7 @@ namespace internal {
     // Timeout cancellation states keep this token after the dispatcher dies.
     // Holding mutex makes a non-null target safe to use, while group_lifetime
     // lets an outstanding activity be finished independently of target.
-    std::mutex mutex;
+    ::cardio::internal::mutex mutex;
     dispatcher* target;
     std::shared_ptr<dispatcher_group_lifetime> group_lifetime;
 
@@ -886,7 +1087,7 @@ namespace internal {
   };
 
   struct promise_state_base {
-    std::mutex mutex;
+    ::cardio::internal::mutex mutex;
     std::coroutine_handle<> coroutine;
     dispatcher_group* group = nullptr;
     std::shared_ptr<dispatcher_group_lifetime> group_lifetime;
@@ -920,7 +1121,7 @@ namespace internal {
 
   inline scheduled_continuation try_schedule_continuation(
       promise_state_base& state) noexcept {
-    auto lock = std::lock_guard<std::mutex>(state.mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state.mutex);
     if (!state.completed.load(std::memory_order_acquire) ||
         !state.continuation || state.continuation_scheduled) {
       return {};
@@ -938,7 +1139,7 @@ namespace internal {
       promise_state_base& state,
       dispatcher* target,
       std::coroutine_handle<> continuation) noexcept {
-    auto lock = std::lock_guard<std::mutex>(state.mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state.mutex);
     state.continuation = continuation;
     state.continuation_dispatcher = target;
     state.continuation_scheduled = false;
@@ -958,7 +1159,7 @@ namespace internal {
 #if CARDIO_HAS_EXCEPTIONS
   inline bool should_propagate_unhandled_exception(
       promise_state_base& state) noexcept {
-    auto lock = std::lock_guard<std::mutex>(state.mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state.mutex);
     if (state.continuation) {
       return false;
     }
@@ -1010,7 +1211,7 @@ namespace internal {
     auto normalized =
         internal::normalize_rejection_exception(std::move(exception));
     {
-      auto lock = std::lock_guard<std::mutex>(state.mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state.mutex);
       if (state.completed.load(std::memory_order_acquire)) {
         return false;
       }
@@ -1064,6 +1265,103 @@ namespace internal {
     std::terminate();
 #endif
   }
+
+  using win32_cancel_io_ex_function = BOOL (WINAPI*)(HANDLE, LPOVERLAPPED);
+
+  inline win32_cancel_io_ex_function find_win32_cancel_io_ex() noexcept {
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0600
+    return &::CancelIoEx;
+#else
+    // Resolve by name: an XP-targeted executable must not import CancelIoEx.
+    const auto address = ::GetProcAddress(
+        ::GetModuleHandleW(L"kernel32.dll"), "CancelIoEx");
+    auto function = win32_cancel_io_ex_function{};
+    static_assert(sizeof(function) == sizeof(address));
+    std::memcpy(&function, &address, sizeof(function));
+    return function;
+#endif
+  }
+
+  struct win32_legacy_io_registry {
+    mutex guard;
+    std::vector<HANDLE> handles;
+  };
+
+#if CARDIO_SHARED_LIB
+  // A host and its plugins must reserve handles in the same registry.
+  CARDIO_API win32_legacy_io_registry& legacy_io_registry();
+#else
+  inline win32_legacy_io_registry& legacy_io_registry() {
+    static win32_legacy_io_registry registry;
+    return registry;
+  }
+#endif
+
+  // CancelIo affects every operation for an issuing thread and HANDLE. Reserve
+  // the handle until native completion, and serialize retirement with cancel
+  // callbacks that may already have been queued when a registration is reset.
+  class win32_io_lease {
+  private:
+    mutex guard_;
+    HANDLE handle_ = nullptr;
+    win32_cancel_io_ex_function cancel_io_ex_ = find_win32_cancel_io_ex();
+
+  public:
+    inline bool is_legacy() const noexcept { return cancel_io_ex_ == nullptr; }
+
+    inline DWORD acquire(HANDLE handle) {
+      if (is_legacy()) {
+        auto& registry = legacy_io_registry();
+        auto lock = std::lock_guard<mutex>(registry.guard);
+        for (auto active : registry.handles) {
+          if (active == handle) {
+            return ERROR_BUSY;
+          }
+        }
+        registry.handles.push_back(handle);
+      }
+      handle_ = handle;
+      return ERROR_SUCCESS;
+    }
+
+    inline void release() noexcept {
+      auto lock = std::lock_guard<mutex>(guard_);
+      if (handle_ == nullptr) {
+        return;
+      }
+      if (is_legacy()) {
+        auto& registry = legacy_io_registry();
+        auto registry_lock = std::lock_guard<mutex>(registry.guard);
+        for (auto current = registry.handles.begin();
+             current != registry.handles.end(); ++current) {
+          if (*current == handle_) {
+            registry.handles.erase(current);
+            break;
+          }
+        }
+      }
+      handle_ = nullptr;
+    }
+
+    inline void cancel(OVERLAPPED& overlapped, DWORD owner_thread) noexcept {
+      auto lock = std::lock_guard<mutex>(guard_);
+      if (handle_ == nullptr) {
+        return;
+      }
+      if (cancel_io_ex_ != nullptr) {
+        (void)cancel_io_ex_(handle_, &overlapped);
+      } else {
+        if (::GetCurrentThreadId() != owner_thread) {
+          // Destruction of an unfinished legacy helper is also an owner-thread
+          // operation. Do not free its OVERLAPPED or cancel unrelated I/O.
+          std::terminate();
+        }
+        (void)::CancelIo(handle_);
+      }
+    }
+
+    inline ~win32_io_lease() { release(); }
+  };
 #endif
 
   [[noreturn]] inline void fail_invalid_argument(const char* message) {
@@ -2093,7 +2391,7 @@ namespace internal {
 inline void cancellation_registration::reset() noexcept {
   auto state = state_;
   if (state && entry_) {
-    auto lock = std::lock_guard<std::mutex>(state->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
     if (entry_->registered && entry_->owner == state.get()) {
       if (entry_->previous != nullptr) {
         entry_->previous->next = entry_->next;
@@ -2131,7 +2429,7 @@ inline bool cancellation::try_register_callback(
   auto already_requested = false;
   auto registered = false;
   {
-    auto lock = std::lock_guard<std::mutex>(state_->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
     if (state_->cancellation_requested) {
       already_requested = true;
     } else {
@@ -2165,7 +2463,7 @@ inline bool cancellation::is_cancellation_requested() const noexcept {
     return false;
   }
 
-  auto lock = std::lock_guard<std::mutex>(state_->mutex);
+  auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
   return state_->cancellation_requested ||
       (state_->timeout_deadline &&
        *state_->timeout_deadline <= std::chrono::steady_clock::now());
@@ -2205,7 +2503,7 @@ namespace internal {
       return;
     }
 
-    auto lock = std::lock_guard<std::mutex>(source.state_->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(source.state_->mutex);
     if (source.state_->cancellation_requested) {
       return;
     }
@@ -2258,7 +2556,7 @@ private:
   friend void internal::activate_current_promise(internal::promise_state_base& state);
   friend void internal::finish_promise(internal::promise_state_base& state) noexcept;
 
-  std::mutex mutex_;
+  ::cardio::internal::mutex mutex_;
   std::vector<dispatcher*> dispatchers_;
   std::atomic<std::size_t> active_promises_ = 0;
   std::atomic<std::size_t> queued_continuations_ = 0;
@@ -2343,7 +2641,7 @@ public:
   }
 
   inline virtual ~dispatcher_group() {
-    auto lock = std::lock_guard<std::mutex>(lifetime_->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(lifetime_->mutex);
     lifetime_->group = nullptr;
   }
 
@@ -2356,7 +2654,7 @@ public:
    */
   inline void shutdown() noexcept {
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       shutdown_requested_.store(true, std::memory_order_release);
     }
     notify_all();
@@ -2368,7 +2666,7 @@ public:
 
 namespace internal {
   inline bool dispatcher_lifetime::add_timeout_activity() noexcept {
-    auto lock = std::lock_guard<std::mutex>(group_lifetime->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(group_lifetime->mutex);
     if (group_lifetime->group == nullptr) {
       return false;
     }
@@ -2378,7 +2676,7 @@ namespace internal {
   }
 
   inline void dispatcher_lifetime::finish_timeout_activity() noexcept {
-    auto lock = std::lock_guard<std::mutex>(group_lifetime->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(group_lifetime->mutex);
     if (group_lifetime->group != nullptr) {
       group_lifetime->group->finish_active_promise();
     }
@@ -2493,11 +2791,12 @@ private:
   friend struct internal::cancellation_state;
 
   dispatcher_feature features_ = dispatcher_feature::none;
+  internal::thread::id owner_thread_id_{};
   std::unique_ptr<dispatcher_group> owned_group_;
   dispatcher_group* group_ = nullptr;
   std::shared_ptr<internal::dispatcher_lifetime> lifetime_;
-  std::mutex mutex_;
-  std::condition_variable condition_;
+  ::cardio::internal::mutex mutex_;
+  ::cardio::internal::condition_variable condition_;
   struct work_item {
     std::coroutine_handle<> continuation;
     std::function<void()> callback;
@@ -2529,7 +2828,7 @@ private:
   std::size_t active_continuations_ = 0;
 #if CARDIO_HAS_NATIVE_WAIT
   bool wait_polling_ = false;
-  std::thread::id wait_polling_thread_id_{};
+  ::cardio::internal::thread::id wait_polling_thread_id_{};
 #endif
 #if CARDIO_HAS_EXCEPTIONS
   std::function<void(std::exception_ptr)> unhandled_exception_;
@@ -2590,7 +2889,7 @@ private:
   inline void mark_wait_polling(bool polling) noexcept {
     wait_polling_ = polling;
     wait_polling_thread_id_ =
-        polling ? std::this_thread::get_id() : std::thread::id{};
+        polling ? ::cardio::internal::current_thread_id() : ::cardio::internal::thread::id{};
   }
 
   inline bool should_notify_native_wait_from_current_thread() const noexcept {
@@ -2599,7 +2898,7 @@ private:
     // poll/g_poll snapshot. Work queued by the polling thread itself will be
     // observed before entering the native wait again.
     return wait_polling_ &&
-           wait_polling_thread_id_ != std::this_thread::get_id();
+           wait_polling_thread_id_ != ::cardio::internal::current_thread_id();
 #else
     return wait_polling_;
 #endif
@@ -2762,7 +3061,7 @@ private:
   inline bool collect_ready_timer_waits() {
     auto work_items = std::vector<work_item>{};
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       work_items =
           collect_expired_timer_waits(std::chrono::steady_clock::now());
       for (auto& work : work_items) {
@@ -2777,7 +3076,7 @@ private:
   }
 
   inline void clear_timer_waits() noexcept {
-    auto lock = std::lock_guard<std::mutex>(mutex_);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
     for (auto& wait : timer_waits_) {
       if (wait && wait->owner == this) {
         wait->owner = nullptr;
@@ -2879,7 +3178,7 @@ private:
 
   inline void finish_continuation() noexcept {
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       --active_continuations_;
     }
     group_->finish_continuation();
@@ -2887,7 +3186,7 @@ private:
 
   inline void start_inline_continuation() {
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       ++active_continuations_;
     }
     group_->active_continuations_.fetch_add(1, std::memory_order_acq_rel);
@@ -2916,7 +3215,7 @@ private:
 #if CARDIO_HAS_NATIVE_WAIT
   inline void clear_wait_polling() noexcept {
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       mark_wait_polling(false);
     }
     condition_.notify_all();
@@ -2948,7 +3247,7 @@ private:
 #endif
     auto collected = false;
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       auto timer_work_items =
           collect_expired_timer_waits(std::chrono::steady_clock::now());
 #if CARDIO_HAS_POSIX_FD
@@ -3084,7 +3383,7 @@ private:
     auto notify_native_wait = false;
 #endif
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       queue_.push_back(std::move(item));
 #if CARDIO_HAS_NATIVE_WAIT
       notify_native_wait = should_notify_native_wait_from_current_thread();
@@ -3200,7 +3499,7 @@ private:
     auto notify_native_wait = false;
 #endif
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
 #if CARDIO_HAS_NATIVE_WAIT
       const auto previous_deadline = next_timer_deadline();
 #endif
@@ -3237,7 +3536,7 @@ private:
     auto notify_native_wait = false;
 #endif
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
 #if CARDIO_HAS_NATIVE_WAIT
       const auto previous_deadline = next_timer_deadline();
 #endif
@@ -3274,7 +3573,7 @@ private:
     auto notify_native_wait = false;
 #endif
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       if (wait && wait->owner == this && wait->registered) {
         wait->owner = nullptr;
         wait->registered = false;
@@ -3311,7 +3610,7 @@ private:
     auto continuation = std::coroutine_handle<>{};
     auto unregistered = false;
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       if (wait && wait->owner == this && wait->registered) {
         wait->canceled = true;
         continuation = wait->continuation;
@@ -3340,7 +3639,7 @@ private:
       std::coroutine_handle<> continuation) {
     auto notify_native_wait = false;
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       fd_waits_.register_wait(this, std::move(wait), continuation);
       notify_native_wait = should_notify_native_wait_from_current_thread();
     }
@@ -3356,7 +3655,7 @@ private:
     auto unregistered = false;
     auto notify_native_wait = false;
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       unregistered = fd_waits_.unregister_wait(this, wait);
       notify_native_wait = should_notify_native_wait_from_current_thread();
     }
@@ -3377,7 +3676,7 @@ private:
     auto unregistered = false;
     auto notify_native_wait = false;
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       if (wait && wait->owner == this && wait->registered) {
         wait->canceled = true;
         continuation = wait->continuation;
@@ -3400,7 +3699,7 @@ private:
 #endif
 
   inline void clear_fd_waits() noexcept {
-    auto lock = std::lock_guard<std::mutex>(mutex_);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
     fd_waits_.clear(this);
 #if CARDIO_WITH_LINUX_IO_URING
     io_uring_waits_.clear(this);
@@ -3414,7 +3713,7 @@ private:
       std::coroutine_handle<> continuation) {
     auto notify_native_wait = false;
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       win32_handle_waits_.register_wait(this, std::move(wait), continuation);
       notify_native_wait = should_notify_native_wait_from_current_thread();
     }
@@ -3430,7 +3729,7 @@ private:
     auto unregistered = false;
     auto notify_native_wait = false;
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       unregistered = win32_handle_waits_.unregister_wait(this, wait);
       notify_native_wait = should_notify_native_wait_from_current_thread();
     }
@@ -3451,7 +3750,7 @@ private:
     auto unregistered = false;
     auto notify_native_wait = false;
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       if (wait && wait->owner == this && wait->registered) {
         wait->canceled = true;
         continuation = wait->continuation;
@@ -3474,7 +3773,7 @@ private:
 #endif
 
   inline void clear_win32_handle_waits() noexcept {
-    auto lock = std::lock_guard<std::mutex>(mutex_);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
     win32_handle_waits_.clear(this);
   }
 #endif
@@ -3487,7 +3786,7 @@ private:
       Prepare prepare) {
     auto notify_native_wait = false;
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       io_uring_waits_.submit_operation(
           this, std::move(ring), std::move(operation), prepare);
       notify_native_wait = should_notify_native_wait_from_current_thread();
@@ -3505,7 +3804,7 @@ private:
     auto submitted = false;
     auto notify_native_wait = false;
     try {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       submitted = io_uring_waits_.submit_cancel_operation(this, operation);
       notify_native_wait = should_notify_native_wait_from_current_thread();
     } catch (...) {
@@ -3574,6 +3873,17 @@ public:
     return features_;
   }
 
+  /**
+   * Reports whether this dispatcher is bound to the calling OS thread.
+   *
+   * @return True for a thread-bound dispatcher on its owner thread; false for
+   * an unbound dispatcher or a call from another thread.
+   */
+  inline bool is_current_thread_owner() const noexcept {
+    return owner_thread_id_ != internal::thread::id{} &&
+           owner_thread_id_ == internal::current_thread_id();
+  }
+
 #if CARDIO_HAS_EXCEPTIONS
   /**
    * Installs a callback for exceptions escaping resumed continuations or posted
@@ -3596,7 +3906,7 @@ public:
 
 inline dispatcher::~dispatcher() {
   // Invalidate target while excluding timeout registration and cleanup paths.
-  auto lifetime_lock = std::lock_guard<std::mutex>(lifetime_->mutex);
+  auto lifetime_lock = std::lock_guard<::cardio::internal::mutex>(lifetime_->mutex);
   lifetime_->target = nullptr;
   clear_timer_waits();
 #if CARDIO_HAS_POSIX_FD
@@ -3636,6 +3946,8 @@ public:
   /**
    * Creates a dispatcher host.
    *
+   * @param policy Whether to bind execution to the constructing thread.
+   *
    * @throws std::system_error Thrown if the fd wakeup backend cannot be
    * initialized.
    *
@@ -3643,19 +3955,30 @@ public:
    * This overload creates an implicit dispatcher_group for single-dispatcher
    * use.
    */
-  inline dispatcher_host(): dispatcher() {
+  inline explicit dispatcher_host(
+      dispatcher_thread_policy policy = dispatcher_thread_policy::any_thread)
+      : dispatcher() {
+    if (policy == dispatcher_thread_policy::current_thread) {
+      owner_thread_id_ = internal::current_thread_id();
+    }
   }
 
   /**
    * Creates a dispatcher host in an existing dispatcher group.
    *
    * @param group Dispatcher group shared with other dispatchers.
+   * @param policy Whether to bind execution to the constructing thread.
    *
    * @throws std::system_error Thrown if the fd wakeup backend cannot be
    * initialized.
    */
-  inline explicit dispatcher_host(dispatcher_group& group)
+  inline explicit dispatcher_host(
+      dispatcher_group& group,
+      dispatcher_thread_policy policy = dispatcher_thread_policy::any_thread)
       : dispatcher(group) {
+    if (policy == dispatcher_thread_policy::current_thread) {
+      owner_thread_id_ = internal::current_thread_id();
+    }
   }
 
   /**
@@ -3678,6 +4001,11 @@ public:
   inline void park(
       shutdown_mode mode = shutdown_mode::gentle,
       park_policy policy = park_policy::external_pump_first) {
+    if (owner_thread_id_ != internal::thread::id{} &&
+        !is_current_thread_owner()) {
+      internal::fail_runtime_error(
+          "cardio: thread-bound dispatcher must be parked on its owner thread");
+    }
 #if !CARDIO_HAS_WIN32_HANDLE
     (void)policy;
 #endif
@@ -3705,7 +4033,7 @@ public:
       auto wait_timeout_milliseconds = -1;
 #endif
       {
-        auto lock = std::unique_lock<std::mutex>(mutex_);
+        auto lock = std::unique_lock<::cardio::internal::mutex>(mutex_);
         if (group_->should_exit_immediately(mode)) {
           return;
         }
@@ -3890,7 +4218,7 @@ namespace internal {
   };
 
   struct android_looper_callback_registry {
-    std::mutex mutex;
+    ::cardio::internal::mutex mutex;
     std::vector<android_looper_callback_entry> entries;
     std::atomic<std::uintptr_t> next_token = 1;
   };
@@ -3909,7 +4237,7 @@ namespace internal {
       token = registry.next_token.fetch_add(1, std::memory_order_relaxed);
     }
 
-    auto lock = std::lock_guard<std::mutex>(registry.mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(registry.mutex);
     registry.entries.push_back(android_looper_callback_entry{token, owner});
     return token;
   }
@@ -3921,7 +4249,7 @@ namespace internal {
     }
 
     auto& registry = get_android_looper_callback_registry();
-    auto lock = std::lock_guard<std::mutex>(registry.mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(registry.mutex);
     for (auto iterator = registry.entries.begin();
          iterator != registry.entries.end(); ++iterator) {
       if (iterator->token == token) {
@@ -3934,7 +4262,7 @@ namespace internal {
   inline dispatcher_host_android_base* find_android_looper_callback(
       std::uintptr_t token) noexcept {
     auto& registry = get_android_looper_callback_registry();
-    auto lock = std::lock_guard<std::mutex>(registry.mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(registry.mutex);
     for (const auto& entry : registry.entries) {
       if (entry.token == token) {
         return entry.owner;
@@ -3964,7 +4292,7 @@ namespace internal {
     std::vector<looper_registration> wait_registrations_;
     dispatcher::wait_snapshot looper_wait_snapshot_;
     bool looper_wait_snapshot_valid_ = false;
-    std::thread::id owner_thread_;
+    ::cardio::internal::thread::id owner_thread_;
     shutdown_mode active_shutdown_mode_ = shutdown_mode::gentle;
     bool parked_ = false;
 
@@ -4029,7 +4357,7 @@ namespace internal {
     }
 
     inline void ensure_owner_thread() const {
-      if (std::this_thread::get_id() != owner_thread_) {
+      if (::cardio::internal::current_thread_id() != owner_thread_) {
         internal::fail_runtime_error(
             "cardio: Android dispatcher must be used on its owner thread");
       }
@@ -4163,7 +4491,7 @@ namespace internal {
     inline void refresh_looper_wait_snapshot() {
       auto snapshot = dispatcher::wait_snapshot{};
       {
-        auto lock = std::lock_guard<std::mutex>(mutex_);
+        auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
         mark_wait_polling(false);
         if (!group_->should_exit_immediately(active_shutdown_mode_)) {
           snapshot = make_wait_snapshot();
@@ -4220,7 +4548,7 @@ namespace internal {
 
     inline work_item take_next_work() {
       auto work = work_item{};
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       if (!group_->should_exit_immediately(active_shutdown_mode_) &&
           !queue_.empty()) {
         mark_wait_polling(false);
@@ -4232,7 +4560,7 @@ namespace internal {
     }
 
     inline bool has_queued_work() noexcept {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       return !queue_.empty();
     }
 
@@ -4343,7 +4671,7 @@ namespace internal {
     }
 
     inline void initialize_looper(bool prepare_if_missing) {
-      owner_thread_ = std::this_thread::get_id();
+      owner_thread_ = ::cardio::internal::current_thread_id();
       looper_ = ALooper_forThread();
       if (looper_ == nullptr && prepare_if_missing) {
         looper_ = ALooper_prepare(0);
@@ -4588,8 +4916,7 @@ public:
 class dispatcher_host_win32_auto final : public dispatcher {
 private:
   HWND message_window_ = nullptr;
-  DWORD owner_thread_id_ = 0;
-  std::thread wait_worker_;
+  ::cardio::internal::thread wait_worker_;
   bool stop_wait_worker_ = false;
   bool shutdown_wait_probe_done_ = false;
   std::atomic<bool> dispatch_message_posted_ = false;
@@ -4632,20 +4959,17 @@ private:
   }
 
   static inline void register_window_class() {
-    static std::once_flag once;
-    std::call_once(once, [] {
-      auto window_class = WNDCLASSW{};
-      window_class.lpfnWndProc = &dispatcher_host_win32_auto::window_proc;
-      window_class.hInstance = ::GetModuleHandleW(nullptr);
-      window_class.lpszClassName = window_class_name();
+    auto window_class = WNDCLASSW{};
+    window_class.lpfnWndProc = &dispatcher_host_win32_auto::window_proc;
+    window_class.hInstance = ::GetModuleHandleW(nullptr);
+    window_class.lpszClassName = window_class_name();
 
-      const auto atom = ::RegisterClassW(&window_class);
-      if (atom == 0 &&
-          ::GetLastError() != static_cast<DWORD>(ERROR_CLASS_ALREADY_EXISTS)) {
-        internal::fail_win32_error(
-            ::GetLastError(), "cardio: RegisterClassW failed");
-      }
-    });
+    const auto atom = ::RegisterClassW(&window_class);
+    if (atom == 0 &&
+        ::GetLastError() != static_cast<DWORD>(ERROR_CLASS_ALREADY_EXISTS)) {
+      internal::fail_win32_error(
+          ::GetLastError(), "cardio: RegisterClassW failed");
+    }
   }
 
   static inline dispatcher_host_win32_auto* window_owner(HWND window) noexcept {
@@ -4720,7 +5044,7 @@ private:
   inline work_item take_message_work() {
     auto work = work_item{};
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       if (!group_->should_exit_immediately(shutdown_mode::gentle) &&
           !queue_.empty()) {
         work = std::move(queue_.front());
@@ -4769,7 +5093,7 @@ private:
 
     auto has_more_work = false;
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       has_more_work =
           !group_->should_exit_immediately(shutdown_mode::gentle) &&
           !queue_.empty();
@@ -4782,7 +5106,7 @@ private:
   inline bool make_worker_wait_snapshot(
       wait_snapshot& snapshot,
       int& timeout_milliseconds) {
-    auto lock = std::unique_lock<std::mutex>(mutex_);
+    auto lock = std::unique_lock<::cardio::internal::mutex>(mutex_);
     condition_.wait(lock, [this] {
       return stop_wait_worker_ ||
              (!wait_polling_ && !waits_empty() &&
@@ -4834,7 +5158,7 @@ private:
 #endif
 
       {
-        auto lock = std::lock_guard<std::mutex>(mutex_);
+        auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
         if (stop_wait_worker_) {
           mark_wait_polling(false);
           return;
@@ -4849,7 +5173,7 @@ private:
 
       const auto collected = collect_ready_wait_snapshot(snapshot);
       if (group_->is_shutdown_requested() && timeout_milliseconds == 0) {
-        auto lock = std::lock_guard<std::mutex>(mutex_);
+        auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
         shutdown_wait_probe_done_ = true;
       }
       if (collected || group_->should_exit(shutdown_mode::gentle)) {
@@ -4882,10 +5206,10 @@ public:
    * use.
    */
   inline dispatcher_host_win32_auto()
-      : dispatcher(),
-        owner_thread_id_(::GetCurrentThreadId()) {
+      : dispatcher() {
+    owner_thread_id_ = ::GetCurrentThreadId();
     create_message_window();
-    wait_worker_ = std::thread([this] { wait_worker_loop(); });
+    wait_worker_ = ::cardio::internal::thread([this] { wait_worker_loop(); });
   }
 
   /**
@@ -4896,10 +5220,10 @@ public:
    * @throws std::system_error Thrown if the message window cannot be created.
    */
   inline explicit dispatcher_host_win32_auto(dispatcher_group& group)
-      : dispatcher(group),
-        owner_thread_id_(::GetCurrentThreadId()) {
+      : dispatcher(group) {
+    owner_thread_id_ = ::GetCurrentThreadId();
     create_message_window();
-    wait_worker_ = std::thread([this] { wait_worker_loop(); });
+    wait_worker_ = ::cardio::internal::thread([this] { wait_worker_loop(); });
   }
 
   /**
@@ -4907,7 +5231,7 @@ public:
    */
   inline ~dispatcher_host_win32_auto() override {
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       stop_wait_worker_ = true;
     }
     condition_.notify_all();
@@ -5198,7 +5522,7 @@ public:
 
       auto work = work_item{};
       {
-        auto lock = std::lock_guard<std::mutex>(mutex_);
+        auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
         if (!group_->should_exit_immediately(mode) && !queue_.empty()) {
           mark_wait_polling(false);
           work = std::move(queue_.front());
@@ -5224,7 +5548,7 @@ public:
       auto wait_snapshot = dispatcher::wait_snapshot{};
       auto has_dispatcher_snapshot = false;
       if (!immediate_shutdown) {
-        auto lock = std::lock_guard<std::mutex>(mutex_);
+        auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
         if (!wait_polling_) {
           wait_snapshot = make_wait_snapshot();
           if (!wait_snapshot.empty()) {
@@ -5421,7 +5745,7 @@ private:
     auto ready = false;
     auto timeout_milliseconds = -1;
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       mark_wait_polling(false);
 
       const auto immediate_shutdown =
@@ -5470,7 +5794,7 @@ private:
 
   inline gboolean check_source() {
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       const auto immediate_shutdown =
           group_->should_exit_immediately(shutdown_mode::gentle);
       if (!immediate_shutdown && !queue_.empty()) {
@@ -5512,7 +5836,7 @@ private:
   inline work_item take_next_work() {
     auto work = work_item{};
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       if (!group_->should_exit_immediately(shutdown_mode::gentle) &&
           !queue_.empty()) {
         mark_wait_polling(false);
@@ -5686,7 +6010,7 @@ public:
   inline void park() {
     auto* loop = g_main_loop_new(glib_group_.context(), FALSE);
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       if (park_loop_ != nullptr) {
         g_main_loop_unref(loop);
         internal::fail_runtime_error("cardio: GLib dispatcher is already parked");
@@ -5699,7 +6023,7 @@ public:
     try {
       g_main_loop_run(loop);
     } catch (...) {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       if (park_loop_ == loop) {
         park_loop_ = nullptr;
       }
@@ -5711,7 +6035,7 @@ public:
 #endif
 
     {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
       if (park_loop_ == loop) {
         park_loop_ = nullptr;
       }
@@ -5733,7 +6057,7 @@ namespace internal {
       return;
     }
 
-    auto lifetime_lock = std::lock_guard<std::mutex>(
+    auto lifetime_lock = std::lock_guard<::cardio::internal::mutex>(
         timeout_dispatcher_lifetime->mutex);
     if (timeout_dispatcher_lifetime->target != nullptr && timeout_wait) {
       timeout_dispatcher_lifetime->target->unregister_timer_wait(timeout_wait);
@@ -5752,7 +6076,7 @@ namespace internal {
     }
 
     {
-      auto lock = std::lock_guard<std::mutex>(source.state_->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(source.state_->mutex);
       source.state_->timeout_deadline = deadline;
       source.state_->timeout_dispatcher_lifetime =
           target != nullptr ? target->lifetime_ : nullptr;
@@ -5775,7 +6099,7 @@ namespace internal {
     auto finish_timeout_activity = false;
 
     {
-      auto lock = std::lock_guard<std::mutex>(state->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
       if (state->cancellation_requested) {
         return false;
       }
@@ -5802,7 +6126,7 @@ namespace internal {
     }
 
     if (timeout_dispatcher_lifetime) {
-      auto lifetime_lock = std::lock_guard<std::mutex>(
+      auto lifetime_lock = std::lock_guard<::cardio::internal::mutex>(
           timeout_dispatcher_lifetime->mutex);
       if (timeout_dispatcher_lifetime->target != nullptr && timeout_wait) {
         timeout_dispatcher_lifetime->target->unregister_timer_wait(
@@ -5829,7 +6153,7 @@ namespace internal {
 
     auto cancel_now = false;
     {
-      auto lock = std::lock_guard<std::mutex>(state->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
       if (state->cancellation_requested || !state->timeout_deadline ||
           state->timeout_wait) {
         return;
@@ -5846,7 +6170,7 @@ namespace internal {
         wait->deadline = *state->timeout_deadline;
         auto weak_state = std::weak_ptr<cancellation_state>(state);
 
-        auto lifetime_lock = std::lock_guard<std::mutex>(lifetime->mutex);
+        auto lifetime_lock = std::lock_guard<::cardio::internal::mutex>(lifetime->mutex);
         auto* target = lifetime->target;
         if (target == nullptr || !lifetime->add_timeout_activity()) {
           return;
@@ -5887,7 +6211,7 @@ namespace internal {
       return;
     }
 
-    auto lock = std::lock_guard<std::mutex>(state->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
     if (state->cancellation_requested || state->callbacks != nullptr ||
         !state->timeout_wait) {
       return;
@@ -5898,7 +6222,7 @@ namespace internal {
     const auto finish_activity = state->timeout_active;
     state->timeout_active = false;
     if (lifetime) {
-      auto lifetime_lock = std::lock_guard<std::mutex>(lifetime->mutex);
+      auto lifetime_lock = std::lock_guard<::cardio::internal::mutex>(lifetime->mutex);
       if (lifetime->target != nullptr) {
         lifetime->target->unregister_timer_wait(wait);
       }
@@ -5950,7 +6274,7 @@ namespace internal {
 }  // namespace internal
 
 inline void dispatcher_group::notify_all() noexcept {
-  auto lock = std::lock_guard<std::mutex>(mutex_);
+  auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
   for (auto* target : dispatchers_) {
     if (target != nullptr) {
       target->notify();
@@ -5965,7 +6289,7 @@ inline void dispatcher_group::notify_if_empty() noexcept {
 }
 
 inline void dispatcher_group::register_dispatcher(dispatcher* target) {
-  auto lock = std::lock_guard<std::mutex>(mutex_);
+  auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
   const auto set_current = dispatchers_.empty();
   dispatchers_.push_back(target);
   if (set_current) {
@@ -5975,7 +6299,7 @@ inline void dispatcher_group::register_dispatcher(dispatcher* target) {
 
 inline void dispatcher_group::unregister_dispatcher(
     dispatcher* target) noexcept {
-  auto lock = std::lock_guard<std::mutex>(mutex_);
+  auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
   for (auto iterator = dispatchers_.begin();
        iterator != dispatchers_.end(); ++iterator) {
     if (*iterator == target) {
@@ -5996,7 +6320,7 @@ namespace internal {
 
   inline void finish_promise(promise_state_base& state) noexcept {
     if (state.active_promise.exchange(false, std::memory_order_acq_rel)) {
-      auto lock = std::lock_guard<std::mutex>(state.group_lifetime->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state.group_lifetime->mutex);
       if (state.group_lifetime->group != nullptr) {
         state.group_lifetime->group->finish_active_promise();
       }
@@ -6579,7 +6903,7 @@ public:
     }
 
     inline ~promise_type() noexcept {
-      auto lock = std::lock_guard<std::mutex>(state_->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
       state_->coroutine = {};
     }
 
@@ -6590,7 +6914,7 @@ public:
      */
     inline promise get_return_object() noexcept {
       {
-        auto lock = std::lock_guard<std::mutex>(state_->mutex);
+        auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
         state_->coroutine =
             std::coroutine_handle<promise_type>::from_promise(*this);
       }
@@ -6687,7 +7011,7 @@ private:
       if (owns_active_lifetime_) {
         internal::finish_promise(*state_);
       }
-      auto lock = std::lock_guard<std::mutex>(state_->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
       state_->continuation = {};
       state_->continuation_dispatcher = nullptr;
       state_->continuation_scheduled = false;
@@ -6941,7 +7265,7 @@ public:
     }
 
     inline ~promise_type() noexcept {
-      auto lock = std::lock_guard<std::mutex>(state_->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
       state_->coroutine = {};
     }
 
@@ -6952,7 +7276,7 @@ public:
      */
     inline promise get_return_object() noexcept {
       {
-        auto lock = std::lock_guard<std::mutex>(state_->mutex);
+        auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
         state_->coroutine =
             std::coroutine_handle<promise_type>::from_promise(*this);
       }
@@ -7046,7 +7370,7 @@ private:
       if (owns_active_lifetime_) {
         internal::finish_promise(*state_);
       }
-      auto lock = std::lock_guard<std::mutex>(state_->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
       state_->continuation = {};
       state_->continuation_dispatcher = nullptr;
       state_->continuation_scheduled = false;
@@ -7244,7 +7568,7 @@ private:
       internal::scheduled_continuation& scheduled) {
     auto& state = require_state();
     {
-      auto lock = std::lock_guard<std::mutex>(state.mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state.mutex);
       if (state.completed.load(std::memory_order_acquire)) {
         return false;
       }
@@ -7300,7 +7624,7 @@ private:
           std::runtime_error("cardio: broken promise_source"));
       auto scheduled = internal::scheduled_continuation{};
       {
-        auto lock = std::lock_guard<std::mutex>(state_->mutex);
+        auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
         if (state_->completed.load(std::memory_order_acquire)) {
           return;
         }
@@ -7559,7 +7883,7 @@ private:
   inline bool try_complete_void(internal::scheduled_continuation& scheduled) {
     auto& state = require_state();
     {
-      auto lock = std::lock_guard<std::mutex>(state.mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state.mutex);
       if (state.completed.load(std::memory_order_acquire)) {
         return false;
       }
@@ -7614,7 +7938,7 @@ private:
           std::runtime_error("cardio: broken promise_source"));
       auto scheduled = internal::scheduled_continuation{};
       {
-        auto lock = std::lock_guard<std::mutex>(state_->mutex);
+        auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
         if (state_->completed.load(std::memory_order_acquire)) {
           return;
         }
@@ -8322,10 +8646,15 @@ namespace internal {
   struct win32_iocp_operation_state {
     OVERLAPPED overlapped{};
     HANDLE handle = nullptr;
+    std::function<DWORD(HANDLE, OVERLAPPED&)> start;
     std::function<void(win32_iocp_completion, bool)> complete;
-    std::atomic<bool> started = false;
+    win32_io_lease lease;
+    bool started = false;
+    bool cancellation_sent = false;
+    std::atomic<bool> retired = false;
     std::atomic<bool> cancellation_requested = false;
 #if CARDIO_HAS_EXCEPTIONS
+    std::function<void(std::exception_ptr)> reject;
     cancellation_registration cancellation_registration_;
 #endif
   };
@@ -8333,108 +8662,162 @@ namespace internal {
   class win32_iocp_port_state {
   private:
     HANDLE port_ = nullptr;
-    std::thread pump_thread_;
-    std::mutex mutex_;
+    thread pump_thread_;
+    mutex mutex_;
+    const std::size_t capacity_;
     std::vector<HANDLE> associated_handles_;
     std::deque<std::shared_ptr<win32_iocp_operation_state>> operations_;
-    bool shutdown_requested_ = false;
+    std::atomic<bool> shutdown_requested_ = false;
+    bool control_packet_posted_ = false;
     bool shutdown_packet_seen_ = false;
+    static constexpr ULONG_PTR control_key = 1;
 
-    static inline void close_handle(HANDLE& handle) noexcept {
-      if (handle == nullptr || handle == INVALID_HANDLE_VALUE) {
-        return;
-      }
-
-      (void)::CloseHandle(handle);
-      handle = nullptr;
-    }
-
-    inline bool is_associated_handle(HANDLE handle) const noexcept {
-      for (auto current : associated_handles_) {
-        if (current == handle) {
+    inline bool associate_handle(HANDLE handle) {
+      for (auto associated : associated_handles_) {
+        if (associated == handle) {
           return true;
         }
       }
-      return false;
-    }
-
-    inline void associate_handle(HANDLE handle) {
-      if (is_associated_handle(handle)) {
-        return;
-      }
-
-      auto* result = ::CreateIoCompletionPort(
-          handle,
-          port_,
-          reinterpret_cast<ULONG_PTR>(handle),
-          0);
-      if (result == nullptr) {
-        internal::fail_win32_error(
-            ::GetLastError(), "cardio: CreateIoCompletionPort failed");
-      }
-      if (result != port_) {
-        internal::fail_runtime_error(
-            "cardio: unexpected IO completion port handle");
-      }
-
-      associated_handles_.push_back(handle);
-    }
-
-    inline bool remove_operation(
-        const std::shared_ptr<win32_iocp_operation_state>& operation) noexcept {
-      if (!operation) {
+      if (::CreateIoCompletionPort(handle, port_,
+              reinterpret_cast<ULONG_PTR>(handle), 0) != port_) {
         return false;
       }
-
-      auto lock = std::lock_guard<std::mutex>(mutex_);
-      for (auto iterator = operations_.begin();
-           iterator != operations_.end(); ++iterator) {
-        if (iterator->get() == operation.get()) {
-          operations_.erase(iterator);
-          return true;
-        }
-      }
-      return false;
+      associated_handles_.push_back(handle);
+      return true;
     }
 
-    inline std::shared_ptr<win32_iocp_operation_state> take_operation(
-        OVERLAPPED* overlapped) noexcept {
-      auto lock = std::lock_guard<std::mutex>(mutex_);
-      for (auto iterator = operations_.begin();
-           iterator != operations_.end(); ++iterator) {
-        if (*iterator && &(*iterator)->overlapped == overlapped) {
-          auto result = *iterator;
-          operations_.erase(iterator);
-          return result;
-        }
+    inline DWORD post_control_locked() noexcept {
+      if (control_packet_posted_) {
+        return ERROR_SUCCESS;
       }
-      return {};
+      if (::PostQueuedCompletionStatus(port_, 0, control_key, nullptr) == 0) {
+        return ::GetLastError();
+      }
+      control_packet_posted_ = true;
+      return ERROR_SUCCESS;
     }
 
-    static inline win32_iocp_completion make_completion(
+    inline void retire(
+        const std::shared_ptr<win32_iocp_operation_state>& operation) noexcept {
+      {
+        auto lock = std::lock_guard<mutex>(mutex_);
+        operation->retired.store(true, std::memory_order_release);
+        for (auto current = operations_.begin(); current != operations_.end(); ++current) {
+          if (current->get() == operation.get()) {
+            operations_.erase(current);
+            break;
+          }
+        }
+      }
+      // Release ownership before resolving a promise or running its mapper.
+      // Already queued cancellation callbacks only carry weak references and
+      // cannot apply CancelIo to the next operation on the same handle.
+      operation->lease.release();
+#if CARDIO_HAS_EXCEPTIONS
+      operation->cancellation_registration_.reset();
+#endif
+      operation->start = {};
+    }
+
+    inline void complete_operation(
         const std::shared_ptr<win32_iocp_operation_state>& operation,
-        ULONG_PTR completion_key,
-        DWORD packet_bytes,
-        DWORD packet_error) noexcept {
-      auto transferred = packet_bytes;
-      auto error = packet_error;
-      auto overlapped_result_bytes = DWORD{};
-      if (::GetOverlappedResult(
-              operation->handle,
-              &operation->overlapped,
-              &overlapped_result_bytes,
-              FALSE) != 0) {
-        transferred = overlapped_result_bytes;
-        error = ERROR_SUCCESS;
-      } else {
-        error = ::GetLastError();
+        win32_iocp_completion completion) noexcept {
+      retire(operation);
+#if CARDIO_HAS_EXCEPTIONS
+      try {
+#endif
+        operation->complete(completion, operation->cancellation_requested.load(
+            std::memory_order_acquire));
+#if CARDIO_HAS_EXCEPTIONS
+      } catch (...) {
+        operation->reject(std::current_exception());
       }
-
-      return win32_iocp_completion{error, transferred, completion_key};
+#endif
     }
 
-    inline bool should_exit_after_completion_locked() const noexcept {
-      return shutdown_packet_seen_ && operations_.empty();
+    inline void fail_start(
+        const std::shared_ptr<win32_iocp_operation_state>& operation,
+        DWORD error) noexcept {
+      retire(operation);
+#if CARDIO_HAS_EXCEPTIONS
+      operation->reject(std::make_exception_ptr(std::system_error(
+          static_cast<int>(error), std::system_category(),
+          "cardio: Win32 IOCP operation failed")));
+#else
+      fail_win32_error(error, "cardio: Win32 IOCP operation failed");
+#endif
+    }
+
+    inline void cancel_on_pump(
+        const std::shared_ptr<win32_iocp_operation_state>& operation) noexcept {
+      if (!operation->cancellation_sent) {
+        operation->cancellation_sent = true;
+        operation->lease.cancel(operation->overlapped, ::GetCurrentThreadId());
+      }
+    }
+
+    inline void process_control() noexcept {
+      auto operations = std::vector<std::shared_ptr<win32_iocp_operation_state>>{};
+      {
+        auto lock = std::lock_guard<mutex>(mutex_);
+        control_packet_posted_ = false;
+        shutdown_packet_seen_ = shutdown_requested_.load(std::memory_order_acquire);
+        operations.assign(operations_.begin(), operations_.end());
+      }
+      for (const auto& operation : operations) {
+        if (shutdown_requested_.load(std::memory_order_acquire)) {
+          operation->cancellation_requested.store(true, std::memory_order_release);
+        }
+        if (operation->cancellation_requested.load(std::memory_order_acquire)) {
+          if (operation->started) {
+            cancel_on_pump(operation);
+          } else {
+            complete_operation(operation, win32_iocp_completion{
+                ERROR_OPERATION_ABORTED, 0, reinterpret_cast<ULONG_PTR>(operation->handle)});
+          }
+          continue;
+        }
+        if (operation->started) {
+          continue;
+        }
+#if CARDIO_HAS_EXCEPTIONS
+        try {
+#endif
+          const auto lease_error = operation->lease.acquire(operation->handle);
+          if (lease_error != ERROR_SUCCESS) {
+            fail_start(operation, lease_error);
+            continue;
+          }
+          if (!associate_handle(operation->handle)) {
+            fail_start(operation, ::GetLastError());
+            continue;
+          }
+          auto start = std::move(operation->start);
+          const auto error = start(operation->handle, operation->overlapped);
+          if (error != ERROR_SUCCESS && error != ERROR_IO_PENDING) {
+            if (error == ERROR_OPERATION_ABORTED &&
+                operation->cancellation_requested.load(std::memory_order_acquire)) {
+              complete_operation(operation, win32_iocp_completion{
+                  error, 0, reinterpret_cast<ULONG_PTR>(operation->handle)});
+            } else {
+              fail_start(operation, error);
+            }
+            continue;
+          }
+          operation->started = true;
+          if (shutdown_requested_.load(std::memory_order_acquire)) {
+            operation->cancellation_requested.store(true, std::memory_order_release);
+          }
+          if (operation->cancellation_requested.load(std::memory_order_acquire)) {
+            cancel_on_pump(operation);
+          }
+#if CARDIO_HAS_EXCEPTIONS
+        } catch (...) {
+          retire(operation);
+          operation->reject(std::current_exception());
+        }
+#endif
+      }
     }
 
     inline bool process_completion(
@@ -8443,38 +8826,33 @@ namespace internal {
         DWORD packet_bytes,
         DWORD packet_error) noexcept {
       if (overlapped == nullptr) {
-        auto lock = std::lock_guard<std::mutex>(mutex_);
-        shutdown_packet_seen_ = true;
-        return !should_exit_after_completion_locked();
-      }
-
-      auto operation = take_operation(overlapped);
-      if (!operation) {
-        return true;
-      }
-
-#if CARDIO_HAS_EXCEPTIONS
-      operation->cancellation_registration_.reset();
-#endif
-
-      auto completion = make_completion(
-          operation, completion_key, packet_bytes, packet_error);
-      const auto cancellation_requested =
-          operation->cancellation_requested.load(std::memory_order_acquire);
-
-      if (operation->complete) {
-#if CARDIO_HAS_EXCEPTIONS
-        try {
-#endif
-          operation->complete(completion, cancellation_requested);
-#if CARDIO_HAS_EXCEPTIONS
-        } catch (...) {
+        if (completion_key == control_key) {
+          process_control();
         }
-#endif
+      } else {
+        auto operation = std::shared_ptr<win32_iocp_operation_state>{};
+        {
+          auto lock = std::lock_guard<mutex>(mutex_);
+          for (const auto& current : operations_) {
+            if (&current->overlapped == overlapped) {
+              operation = current;
+              break;
+            }
+          }
+        }
+        if (operation) {
+          auto bytes = packet_bytes;
+          auto error = packet_error;
+          if (::GetOverlappedResult(operation->handle, overlapped, &bytes, FALSE)) {
+            error = ERROR_SUCCESS;
+          } else {
+            error = ::GetLastError();
+          }
+          complete_operation(operation, win32_iocp_completion{error, bytes, completion_key});
+        }
       }
-
-      auto lock = std::lock_guard<std::mutex>(mutex_);
-      return !should_exit_after_completion_locked();
+      auto lock = std::lock_guard<mutex>(mutex_);
+      return !(shutdown_packet_seen_ && operations_.empty());
     }
 
     inline bool pump_one() noexcept {
@@ -8482,42 +8860,25 @@ namespace internal {
       auto completion_key = ULONG_PTR{};
       auto* overlapped = static_cast<OVERLAPPED*>(nullptr);
       const auto succeeded = ::GetQueuedCompletionStatus(
-          port_,
-          &bytes,
-          &completion_key,
-          &overlapped,
-          INFINITE);
-      const auto packet_error =
-          succeeded != 0 ? ERROR_SUCCESS : ::GetLastError();
-
-      if (overlapped == nullptr && succeeded == 0) {
-        return false;
+          port_, &bytes, &completion_key, &overlapped, INFINITE);
+      const auto error = succeeded ? ERROR_SUCCESS : ::GetLastError();
+      if (overlapped == nullptr && !succeeded) {
+        std::terminate();
       }
-
-      return process_completion(
-          overlapped, completion_key, bytes, packet_error);
+      return process_completion(overlapped, completion_key, bytes, error);
     }
 
 #if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0600
     inline bool pump_many() noexcept {
       OVERLAPPED_ENTRY entries[16]{};
       auto removed = ULONG{};
-      if (::GetQueuedCompletionStatusEx(
-              port_,
-              entries,
-              static_cast<ULONG>(sizeof(entries) / sizeof(entries[0])),
-              &removed,
-              INFINITE,
-              FALSE) == 0) {
+      if (::GetQueuedCompletionStatusEx(port_, entries, 16, &removed, INFINITE, FALSE) == 0) {
         return pump_one();
       }
-
       for (auto index = ULONG{0}; index < removed; ++index) {
-        if (!process_completion(
-                entries[index].lpOverlapped,
+        if (!process_completion(entries[index].lpOverlapped,
                 entries[index].lpCompletionKey,
-                entries[index].dwNumberOfBytesTransferred,
-                ERROR_SUCCESS)) {
+                entries[index].dwNumberOfBytesTransferred, ERROR_SUCCESS)) {
           return false;
         }
       }
@@ -8540,20 +8901,22 @@ namespace internal {
     }
 
   public:
-    inline win32_iocp_port_state() {
+    inline explicit win32_iocp_port_state(std::size_t capacity)
+        : capacity_(capacity) {
+      if (capacity == 0) {
+        fail_invalid_argument("cardio: IOCP capacity must be greater than zero");
+      }
       port_ = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
       if (port_ == nullptr) {
-        internal::fail_win32_error(
-            ::GetLastError(), "cardio: CreateIoCompletionPort failed");
+        fail_win32_error(::GetLastError(), "cardio: CreateIoCompletionPort failed");
       }
-
 #if CARDIO_HAS_EXCEPTIONS
       try {
 #endif
-        pump_thread_ = std::thread([this] { pump_loop(); });
+        pump_thread_ = thread([this] { pump_loop(); });
 #if CARDIO_HAS_EXCEPTIONS
       } catch (...) {
-        close_handle(port_);
+        (void)::CloseHandle(port_);
         throw;
       }
 #endif
@@ -8561,92 +8924,47 @@ namespace internal {
 
     inline ~win32_iocp_port_state() {
       request_shutdown();
-      if (pump_thread_.joinable()) {
-#if CARDIO_HAS_EXCEPTIONS
-        try {
-#endif
-          pump_thread_.join();
-#if CARDIO_HAS_EXCEPTIONS
-        } catch (...) {
-        }
-#endif
-      }
-      close_handle(port_);
+      pump_thread_.join();
+      (void)::CloseHandle(port_);
     }
 
     win32_iocp_port_state(const win32_iocp_port_state&) = delete;
     win32_iocp_port_state& operator=(const win32_iocp_port_state&) = delete;
 
-    template <typename Start>
     inline DWORD start_operation(
-        HANDLE handle,
-        const std::shared_ptr<win32_iocp_operation_state>& operation,
-        Start start) {
-      {
-        auto lock = std::lock_guard<std::mutex>(mutex_);
-        if (shutdown_requested_) {
-          internal::fail_runtime_error(
-              "cardio: IO completion port is shutting down");
-        }
-        associate_handle(handle);
-        operations_.push_back(operation);
+        const std::shared_ptr<win32_iocp_operation_state>& operation) {
+      auto lock = std::lock_guard<mutex>(mutex_);
+      if (shutdown_requested_.load(std::memory_order_acquire)) {
+        return ERROR_OPERATION_ABORTED;
       }
-
-      auto start_error = DWORD{ERROR_SUCCESS};
-#if CARDIO_HAS_EXCEPTIONS
-      try {
-#endif
-        start_error = static_cast<DWORD>(
-            std::invoke(std::move(start), handle, operation->overlapped));
-#if CARDIO_HAS_EXCEPTIONS
-      } catch (...) {
-        (void)remove_operation(operation);
-        throw;
+      if (operations_.size() >= capacity_) {
+        return ERROR_NOT_ENOUGH_QUOTA;
       }
-#endif
-
-      if (start_error == ERROR_SUCCESS || start_error == ERROR_IO_PENDING) {
-        operation->started.store(true, std::memory_order_release);
-        if (operation->cancellation_requested.load(std::memory_order_acquire)) {
-          cancel_operation(operation);
-        }
-        return start_error;
+      operations_.push_back(operation);
+      const auto error = post_control_locked();
+      if (error != ERROR_SUCCESS) {
+        operations_.pop_back();
       }
-
-      (void)remove_operation(operation);
-      return start_error;
+      return error;
     }
 
-    inline void cancel_operation(
+    inline void request_cancel(
         const std::shared_ptr<win32_iocp_operation_state>& operation) noexcept {
-      if (!operation ||
-          !operation->started.load(std::memory_order_acquire)) {
+      auto lock = std::lock_guard<mutex>(mutex_);
+      if (operation->retired.load(std::memory_order_acquire)) {
         return;
       }
-
-      if (::CancelIoEx(operation->handle, &operation->overlapped) == 0) {
-        (void)::GetLastError();
+      operation->cancellation_requested.store(true, std::memory_order_release);
+      if (post_control_locked() != ERROR_SUCCESS) {
+        std::terminate();
       }
     }
 
     inline void request_shutdown() noexcept {
-      auto operations =
-          std::vector<std::shared_ptr<win32_iocp_operation_state>>{};
-      {
-        auto lock = std::lock_guard<std::mutex>(mutex_);
-        if (shutdown_requested_) {
-          return;
-        }
-        shutdown_requested_ = true;
-        operations.assign(operations_.begin(), operations_.end());
-      }
-
-      for (const auto& operation : operations) {
-        cancel_operation(operation);
-      }
-
-      if (port_ != nullptr) {
-        (void)::PostQueuedCompletionStatus(port_, 0, 0, nullptr);
+      auto lock = std::lock_guard<mutex>(mutex_);
+      if (!shutdown_requested_.exchange(true, std::memory_order_acq_rel) &&
+          post_control_locked() != ERROR_SUCCESS) {
+        std::terminate();
       }
     }
   };
@@ -8657,9 +8975,18 @@ namespace internal {
  * Win32 I/O completion port for helper-owned OVERLAPPED operations.
  *
  * @remarks
- * The completion port owns a background pump thread. Only operations submitted
- * through this object are completed by it; do not mix the same handle with
- * from_win32_overlapped() waits or another completion port.
+ * The completion port owns one pump thread for starting, canceling, and
+ * completing I/O. Only operations submitted through this object are completed
+ * by it; do not mix the same handle with external I/O, from_win32_overlapped()
+ * waits, or another completion port. Destroy the port outside its callbacks.
+ * Destruction cancels outstanding work and waits for native completion; drivers
+ * that do not finish cancellation can delay destruction indefinitely.
+ *
+ * XP targets resolve CancelIoEx at runtime. Without it, CancelIo runs on the
+ * pump thread and only one operation per HANDLE may be outstanding (ERROR_BUSY
+ * otherwise). Keep associated handles open while using this port, since handle
+ * associations are cached. All targets bound queued plus in-flight operations
+ * by the constructor capacity (ERROR_NOT_ENOUGH_QUOTA when full).
  */
 class io_completion_port {
 private:
@@ -8767,6 +9094,10 @@ private:
     auto result = source->get_promise();
     auto operation = std::make_shared<internal::win32_iocp_operation_state>();
     operation->handle = handle;
+    auto start_handler = std::make_shared<std::decay_t<Start>>(std::move(start));
+    operation->start = [start_handler](HANDLE target, OVERLAPPED& overlapped) {
+      return static_cast<DWORD>(std::invoke(*start_handler, target, overlapped));
+    };
     auto complete_handler =
         std::make_shared<std::decay_t<Complete>>(std::move(complete));
     operation->complete =
@@ -8778,15 +9109,17 @@ private:
     };
 
 #if CARDIO_HAS_EXCEPTIONS
+    operation->reject = [source](std::exception_ptr exception) {
+      source->reject(std::move(exception));
+    };
     if (cancellation_signal != nullptr) {
       operation->cancellation_registration_ =
-          cancellation_signal->on_cancellation_requested([operation] {
-            operation->cancellation_requested.store(
-                true, std::memory_order_release);
-            if (operation->started.load(std::memory_order_acquire)) {
-              if (::CancelIoEx(
-                      operation->handle, &operation->overlapped) == 0) {
-                (void)::GetLastError();
+          cancellation_signal->on_cancellation_requested(
+              [weak_operation = std::weak_ptr<internal::win32_iocp_operation_state>(operation),
+               weak_port = std::weak_ptr<internal::win32_iocp_port_state>(state_)] {
+            if (auto current = weak_operation.lock()) {
+              if (auto port = weak_port.lock()) {
+                port->request_cancel(current);
               }
             }
           });
@@ -8797,8 +9130,7 @@ private:
 #if CARDIO_HAS_EXCEPTIONS
     try {
 #endif
-      start_error = state_->start_operation(
-          handle, operation, std::move(start));
+      start_error = state_->start_operation(operation);
 #if CARDIO_HAS_EXCEPTIONS
     } catch (...) {
       operation->cancellation_registration_.reset();
@@ -8832,10 +9164,12 @@ public:
   /**
    * Creates an I/O completion port and starts its pump thread.
    *
+   * @param capacity Maximum number of queued and in-flight operations.
+   * @throws std::invalid_argument Thrown when capacity is zero.
    * @throws std::system_error Thrown when CreateIoCompletionPort fails.
    */
-  inline io_completion_port()
-      : state_(std::make_shared<internal::win32_iocp_port_state>()) {
+  inline explicit io_completion_port(std::size_t capacity = 256)
+      : state_(std::make_shared<internal::win32_iocp_port_state>(capacity)) {
   }
 
   io_completion_port(const io_completion_port&) = delete;
@@ -8882,6 +9216,10 @@ public:
    * @remarks
    * The handle and any buffers referenced by start are not owned and must remain
    * valid until completion. The operation must produce an IOCP completion packet.
+   * start and complete execute on the port's pump thread and must not block it.
+   * start must return promptly after issuing asynchronous I/O and must not throw
+   * after successfully issuing I/O. Start failures can complete asynchronously.
+   * Excess submissions fail with ERROR_NOT_ENOUGH_QUOTA before start is called.
    */
   template <typename T, typename Start, typename Complete>
   inline promise<T> submit(HANDLE handle, Start start, Complete complete) {
@@ -8903,9 +9241,12 @@ public:
    * @return Promise that resolves with the value returned by complete.
    *
    * @remarks
-   * Cancellation calls CancelIoEx() for the helper-owned OVERLAPPED operation
-   * on a best-effort basis. The returned promise completes after the native
-   * completion packet has been dequeued.
+   * Uses the same pump-thread and lifetime contract as the non-cancellable
+   * overload. Cancellation uses CancelIoEx when available, or CancelIo on the
+   * issuing pump thread. Keep the registering dispatcher running to deliver
+   * cancellation callbacks. After I/O starts, the promise completes only after
+   * its native completion packet has been dequeued. Queued cancellation skips
+   * the starter entirely.
    */
   template <typename T, typename Start, typename Complete>
   inline promise<T> submit(
@@ -8995,7 +9336,7 @@ private:
 #endif
 
           {
-            auto lock = std::lock_guard<std::mutex>(promise_state->mutex);
+            auto lock = std::lock_guard<::cardio::internal::mutex>(promise_state->mutex);
             if (promise_state->completed.load(std::memory_order_acquire)) {
               return {};
             }
@@ -9019,7 +9360,7 @@ private:
 #endif
 
           {
-            auto lock = std::lock_guard<std::mutex>(promise_state->mutex);
+            auto lock = std::lock_guard<::cardio::internal::mutex>(promise_state->mutex);
             if (promise_state->completed.load(std::memory_order_acquire)) {
               return {};
             }
@@ -9232,6 +9573,19 @@ inline cancellation_source any(Cancellations... cancellations) {
 }  // namespace cancellations
 
 #if CARDIO_HAS_WIN32_HANDLE
+/**
+ * Event-based helpers that own a single-shot OVERLAPPED and its wait event.
+ *
+ * @remarks
+ * Handles and buffers are borrowed until native completion. XP targets resolve
+ * CancelIoEx at runtime. When it is absent, all helpers require a dispatcher
+ * bound to the current OS thread (ERROR_NOT_SUPPORTED otherwise), and a HANDLE
+ * may have only one outstanding cardio operation (ERROR_BUSY otherwise).
+ * Do not mix external I/O on that HANDLE. Keep the dispatcher alive and destroy
+ * unfinished promises on its owner thread; destruction cancels and waits for
+ * native completion. Violating owner-thread destruction terminates the process.
+ * A cancellation request alone never permits early buffer or OVERLAPPED reuse.
+ */
 namespace win32 {
 
   namespace internal {
@@ -9268,21 +9622,46 @@ namespace win32 {
       OVERLAPPED overlapped{};
       std::atomic<bool> pending = false;
       std::atomic<bool> cancellation_requested = false;
+      ::cardio::internal::win32_io_lease lease;
+      DWORD owner_thread = ::GetCurrentThreadId();
 
       inline overlapped_operation_state(HANDLE handle_value, HANDLE event_value)
-          : handle(handle_value),
-            event(event_value) {
+          : handle(handle_value), event(event_value) {
         overlapped.hEvent = event;
+        if (lease.is_legacy() &&
+            !::cardio::internal::require_current_dispatcher().is_current_thread_owner()) {
+          ::cardio::internal::fail_win32_error(
+              ERROR_NOT_SUPPORTED,
+              "cardio: CancelIo requires a dispatcher bound to the issuing thread");
+        }
+        const auto error = lease.acquire(handle);
+        if (error != ERROR_SUCCESS) {
+          ::cardio::internal::fail_win32_error(
+              error, "cardio: legacy Win32 I/O handle is already in use");
+        }
+      }
+
+      inline void finish() noexcept {
+        if (pending.exchange(false, std::memory_order_acq_rel)) {
+          auto ignored = DWORD{};
+          if (::GetOverlappedResult(handle, &overlapped, &ignored, FALSE) == 0 &&
+              ::GetLastError() == ERROR_IO_INCOMPLETE) {
+            lease.cancel(overlapped, owner_thread);
+            (void)::GetOverlappedResult(handle, &overlapped, &ignored, TRUE);
+          }
+        }
+        lease.release();
       }
 
       inline ~overlapped_operation_state() {
-        if (pending.exchange(false, std::memory_order_acq_rel)) {
-          (void)::CancelIoEx(handle, &overlapped);
-          auto ignored = DWORD{};
-          (void)::GetOverlappedResult(handle, &overlapped, &ignored, TRUE);
-        }
+        finish();
         close_handle(event);
       }
+    };
+
+    struct overlapped_operation_scope {
+      overlapped_operation_state& operation;
+      inline ~overlapped_operation_scope() { operation.finish(); }
     };
 
     template <typename T>
@@ -9363,6 +9742,7 @@ namespace win32 {
         std::shared_ptr<overlapped_operation_state> operation,
         Start start,
         Complete complete) {
+      auto scope = overlapped_operation_scope{*operation};
       auto start_error = static_cast<DWORD>(
           std::invoke(start, operation->handle, operation->overlapped));
 
@@ -9402,7 +9782,6 @@ namespace win32 {
         operation->pending.store(false, std::memory_order_release);
 #if CARDIO_HAS_EXCEPTIONS
       } catch (...) {
-        operation->pending.store(false, std::memory_order_release);
         throw;
       }
 #endif
@@ -9422,6 +9801,7 @@ namespace win32 {
         Start start,
         Complete complete,
         cancellation cancellation_signal) {
+      auto scope = overlapped_operation_scope{*operation};
       auto start_error = static_cast<DWORD>(
           std::invoke(start, operation->handle, operation->overlapped));
 
@@ -9455,8 +9835,8 @@ namespace win32 {
           [operation] {
             operation->cancellation_requested.store(
                 true, std::memory_order_release);
-            if (::CancelIoEx(operation->handle, &operation->overlapped) == 0) {
-              (void)::GetLastError();
+            if (operation->pending.load(std::memory_order_acquire)) {
+              operation->lease.cancel(operation->overlapped, operation->owner_thread);
             }
           });
 
@@ -9467,7 +9847,6 @@ namespace win32 {
                 operation->handle, operation->overlapped);
         operation->pending.store(false, std::memory_order_release);
       } catch (const std::system_error& error) {
-        operation->pending.store(false, std::memory_order_release);
         registration.reset();
         if (operation->cancellation_requested.load(
                 std::memory_order_acquire) &&
@@ -9476,7 +9855,6 @@ namespace win32 {
         }
         throw;
       } catch (...) {
-        operation->pending.store(false, std::memory_order_release);
         registration.reset();
         throw;
       }
@@ -9794,9 +10172,10 @@ namespace win32 {
    * @return Promise that resolves with the completed byte count.
    *
    * @remarks
-   * Cancellation calls CancelIoEx() for the helper-owned OVERLAPPED operation
-   * on a best-effort basis. The returned promise completes after the native
-   * operation has completed.
+   * Cancellation uses CancelIoEx when available, or CancelIo on the issuing
+   * thread. Without CancelIoEx, use a thread-bound dispatcher on its owner
+   * thread and allow only one pending operation on this HANDLE. The promise
+   * completes after native completion; see the win32 namespace lifetime rules.
    */
   template <typename Start>
   inline promise<win32_overlapped_result> submit(
@@ -9825,9 +10204,10 @@ namespace win32 {
    * @return Promise that resolves with the value returned by complete.
    *
    * @remarks
-   * Cancellation calls CancelIoEx() for the helper-owned OVERLAPPED operation
-   * on a best-effort basis. The returned promise completes after the native
-   * operation has completed.
+   * Cancellation uses CancelIoEx when available, or CancelIo on the issuing
+   * thread. Without CancelIoEx, use a thread-bound dispatcher on its owner
+   * thread and allow only one pending operation on this HANDLE. The promise
+   * completes after native completion; see the win32 namespace lifetime rules.
    */
   template <typename T, typename Start, typename Complete>
   inline promise<T> submit(
@@ -9882,9 +10262,10 @@ namespace win32 {
    * @return Promise that resolves with the number of bytes read.
    *
    * @remarks
-   * Cancellation calls CancelIoEx() for the helper-owned OVERLAPPED operation
-   * on a best-effort basis. The returned promise completes after the native
-   * operation has completed.
+   * Cancellation uses CancelIoEx when available, or CancelIo on the issuing
+   * thread. Without CancelIoEx, use a thread-bound dispatcher on its owner
+   * thread and allow only one pending operation on this HANDLE. The promise
+   * completes after native completion; see the win32 namespace lifetime rules.
    */
   inline promise<std::size_t> read(
       HANDLE handle,
@@ -9954,9 +10335,10 @@ namespace win32 {
    * @return Promise that resolves with the number of bytes written.
    *
    * @remarks
-   * Cancellation calls CancelIoEx() for the helper-owned OVERLAPPED operation
-   * on a best-effort basis. The returned promise completes after the native
-   * operation has completed.
+   * Cancellation uses CancelIoEx when available, or CancelIo on the issuing
+   * thread. Without CancelIoEx, use a thread-bound dispatcher on its owner
+   * thread and allow only one pending operation on this HANDLE. The promise
+   * completes after native completion; see the win32 namespace lifetime rules.
    */
   inline promise<std::size_t> write(
       HANDLE handle,
@@ -13064,7 +13446,7 @@ inline auto start_new(Function&& function) {
 #if CARDIO_HAS_EXCEPTIONS
   try {
 #endif
-    auto worker = std::thread(
+    auto worker = ::cardio::internal::thread(
         [state,
          function = function_type(std::forward<Function>(function))]() mutable {
           internal::start_new_worker(state, std::move(function));
@@ -13193,7 +13575,7 @@ template <typename ResultTuple> struct all_tuple_state {
   using optional_tuple_type =
       typename all_optional_tuple<ResultTuple>::type;
 
-  std::mutex mutex;
+  ::cardio::internal::mutex mutex;
   std::size_t remaining;
   bool completed = false;
   optional_tuple_type values;
@@ -13205,7 +13587,7 @@ template <typename ResultTuple> struct all_tuple_state {
 
   template <std::size_t Index, typename T>
   inline std::optional<ResultTuple> complete_value(T value) {
-    auto lock = std::lock_guard<std::mutex>(mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(mutex);
     if (completed) {
       return std::nullopt;
     }
@@ -13221,7 +13603,7 @@ template <typename ResultTuple> struct all_tuple_state {
   }
 
   inline std::optional<ResultTuple> complete_void() {
-    auto lock = std::lock_guard<std::mutex>(mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(mutex);
     if (completed) {
       return std::nullopt;
     }
@@ -13237,7 +13619,7 @@ template <typename ResultTuple> struct all_tuple_state {
 
 #if CARDIO_HAS_EXCEPTIONS
   inline bool fail() {
-    auto lock = std::lock_guard<std::mutex>(mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(mutex);
     if (completed) {
       return false;
     }
@@ -13261,7 +13643,7 @@ private:
 };
 
 struct all_void_state {
-  std::mutex mutex;
+  ::cardio::internal::mutex mutex;
   std::size_t remaining;
   bool completed = false;
   promise_source<void> source;
@@ -13271,7 +13653,7 @@ struct all_void_state {
   }
 
   inline bool complete_one() {
-    auto lock = std::lock_guard<std::mutex>(mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(mutex);
     if (completed) {
       return false;
     }
@@ -13287,7 +13669,7 @@ struct all_void_state {
 
 #if CARDIO_HAS_EXCEPTIONS
   inline bool fail() {
-    auto lock = std::lock_guard<std::mutex>(mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(mutex);
     if (completed) {
       return false;
     }
@@ -13299,7 +13681,7 @@ struct all_void_state {
 };
 
 template <typename T> struct all_vector_state {
-  std::mutex mutex;
+  ::cardio::internal::mutex mutex;
   std::size_t remaining;
   bool completed = false;
   std::vector<std::optional<T>> values;
@@ -13313,7 +13695,7 @@ template <typename T> struct all_vector_state {
   inline std::optional<std::vector<T>> complete_value(
       std::size_t index,
       T value) {
-    auto lock = std::lock_guard<std::mutex>(mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(mutex);
     if (completed) {
       return std::nullopt;
     }
@@ -13336,7 +13718,7 @@ template <typename T> struct all_vector_state {
 
 #if CARDIO_HAS_EXCEPTIONS
   inline bool fail() {
-    auto lock = std::lock_guard<std::mutex>(mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(mutex);
     if (completed) {
       return false;
     }
@@ -13736,7 +14118,7 @@ struct mutex_waiter {
 };
 
 struct mutex_state {
-  std::mutex mutex;
+  ::cardio::internal::mutex mutex;
   bool locked = false;
   std::deque<std::shared_ptr<mutex_waiter>> waiters;
 };
@@ -13763,7 +14145,7 @@ inline void process_mutex_queue(
     const std::shared_ptr<mutex_state>& state) {
   auto waiter = std::shared_ptr<mutex_waiter>{};
   {
-    auto lock = std::lock_guard<std::mutex>(state->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
     if (state->locked) {
       return;
     }
@@ -13787,7 +14169,7 @@ inline void process_mutex_queue(
 
 inline void release_mutex(const std::shared_ptr<mutex_state>& state) {
   {
-    auto lock = std::lock_guard<std::mutex>(state->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
     if (!state->locked) {
       return;
     }
@@ -13809,7 +14191,7 @@ inline void cancel_mutex_waiter(
 
   auto should_cancel = false;
   {
-    auto lock = std::lock_guard<std::mutex>(state->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
     if (waiter->queued) {
       (void)erase_waiter(state->waiters, waiter);
       waiter->queued = false;
@@ -13833,7 +14215,7 @@ struct semaphore_waiter {
 };
 
 struct semaphore_state {
-  std::mutex mutex;
+  ::cardio::internal::mutex mutex;
   std::size_t available = 0;
   std::deque<std::shared_ptr<semaphore_waiter>> waiters;
 };
@@ -13875,7 +14257,7 @@ inline void process_semaphore_queue(
 inline void release_semaphore(const std::shared_ptr<semaphore_state>& state) {
   auto ready = std::vector<std::shared_ptr<semaphore_waiter>>{};
   {
-    auto lock = std::lock_guard<std::mutex>(state->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
     ++state->available;
     process_semaphore_queue(state, ready);
   }
@@ -13897,7 +14279,7 @@ inline void cancel_semaphore_waiter(
 
   auto should_cancel = false;
   {
-    auto lock = std::lock_guard<std::mutex>(state->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
     if (waiter->queued) {
       (void)erase_waiter(state->waiters, waiter);
       waiter->queued = false;
@@ -13925,7 +14307,7 @@ struct reader_writer_state {
       : policy(policy) {
   }
 
-  std::mutex mutex;
+  ::cardio::internal::mutex mutex;
   reader_writer_lock_policy policy;
   std::size_t current_readers = 0;
   bool has_writer = false;
@@ -14008,7 +14390,7 @@ inline void process_reader_writer_queue(
     const std::shared_ptr<reader_writer_state>& state) {
   auto completions = std::vector<reader_writer_completion>{};
   {
-    auto lock = std::lock_guard<std::mutex>(state->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
     if (state->has_writer) {
       return;
     }
@@ -14035,7 +14417,7 @@ inline void release_reader_lock(
     const std::shared_ptr<reader_writer_state>& state) {
   auto should_process = false;
   {
-    auto lock = std::lock_guard<std::mutex>(state->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
     if (state->current_readers == 0) {
       return;
     }
@@ -14052,7 +14434,7 @@ inline void release_reader_lock(
 inline void release_writer_lock(
     const std::shared_ptr<reader_writer_state>& state) {
   {
-    auto lock = std::lock_guard<std::mutex>(state->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
     if (!state->has_writer) {
       return;
     }
@@ -14075,7 +14457,7 @@ inline void cancel_reader_writer_waiter(
 
   auto should_cancel = false;
   {
-    auto lock = std::lock_guard<std::mutex>(state->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
     if (waiter->queued) {
       if (read_waiter) {
         (void)erase_waiter(state->read_waiters, waiter);
@@ -14103,7 +14485,7 @@ struct conditional_waiter {
 };
 
 struct conditional_state {
-  std::mutex mutex;
+  ::cardio::internal::mutex mutex;
   bool raised = false;
   std::deque<std::shared_ptr<conditional_waiter>> waiters;
 };
@@ -14141,7 +14523,7 @@ inline void cancel_conditional_waiter(
 
   auto should_cancel = false;
   {
-    auto lock = std::lock_guard<std::mutex>(state->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
     if (waiter->queued) {
       (void)erase_waiter(state->waiters, waiter);
       waiter->queued = false;
@@ -14176,7 +14558,7 @@ public:
     auto state = state_;
     auto waiter = std::shared_ptr<internal::mutex_waiter>{};
     {
-      auto lock = std::lock_guard<std::mutex>(state->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
       if (!state->locked) {
         state->locked = true;
         return resolved(internal::make_mutex_handle(state));
@@ -14204,7 +14586,7 @@ public:
     auto state = state_;
     auto waiter = std::shared_ptr<internal::mutex_waiter>{};
     {
-      auto lock = std::lock_guard<std::mutex>(state->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
       if (!state->locked) {
         state->locked = true;
         return resolved(internal::make_mutex_handle(state));
@@ -14231,7 +14613,7 @@ public:
    * @return True when the mutex is locked.
    */
   inline bool is_locked() const noexcept {
-    auto lock = std::lock_guard<std::mutex>(state_->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
     return state_->locked;
   }
 
@@ -14241,7 +14623,7 @@ public:
    * @return Pending waiter count.
    */
   inline std::size_t pending_count() const noexcept {
-    auto lock = std::lock_guard<std::mutex>(state_->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
     return state_->waiters.size();
   }
 };
@@ -14282,7 +14664,7 @@ public:
     auto state = state_;
     auto waiter = std::shared_ptr<internal::semaphore_waiter>{};
     {
-      auto lock = std::lock_guard<std::mutex>(state->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
       if (state->available > 0) {
         --state->available;
         return resolved(internal::make_semaphore_handle(state));
@@ -14310,7 +14692,7 @@ public:
     auto state = state_;
     auto waiter = std::shared_ptr<internal::semaphore_waiter>{};
     {
-      auto lock = std::lock_guard<std::mutex>(state->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
       if (state->available > 0) {
         --state->available;
         return resolved(internal::make_semaphore_handle(state));
@@ -14338,7 +14720,7 @@ public:
    * @return Available slot count.
    */
   inline std::size_t available_count() const noexcept {
-    auto lock = std::lock_guard<std::mutex>(state_->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
     return state_->available;
   }
 
@@ -14348,7 +14730,7 @@ public:
    * @return Pending waiter count.
    */
   inline std::size_t pending_count() const noexcept {
-    auto lock = std::lock_guard<std::mutex>(state_->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
     return state_->waiters.size();
   }
 };
@@ -14389,7 +14771,7 @@ public:
     auto state = state_;
     auto waiter = std::shared_ptr<internal::reader_writer_waiter>{};
     {
-      auto lock = std::lock_guard<std::mutex>(state->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
       if (can_read_immediately()) {
         ++state->current_readers;
         return resolved(internal::make_reader_handle(state));
@@ -14417,7 +14799,7 @@ public:
     auto state = state_;
     auto waiter = std::shared_ptr<internal::reader_writer_waiter>{};
     {
-      auto lock = std::lock_guard<std::mutex>(state->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
       if (can_read_immediately()) {
         ++state->current_readers;
         return resolved(internal::make_reader_handle(state));
@@ -14448,7 +14830,7 @@ public:
     auto state = state_;
     auto waiter = std::shared_ptr<internal::reader_writer_waiter>{};
     {
-      auto lock = std::lock_guard<std::mutex>(state->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
       if (!state->has_writer && state->current_readers == 0) {
         state->has_writer = true;
         return resolved(internal::make_writer_handle(state));
@@ -14476,7 +14858,7 @@ public:
     auto state = state_;
     auto waiter = std::shared_ptr<internal::reader_writer_waiter>{};
     {
-      auto lock = std::lock_guard<std::mutex>(state->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state->mutex);
       if (!state->has_writer && state->current_readers == 0) {
         state->has_writer = true;
         return resolved(internal::make_writer_handle(state));
@@ -14504,7 +14886,7 @@ public:
    * @return Active reader count.
    */
   inline std::size_t current_readers() const noexcept {
-    auto lock = std::lock_guard<std::mutex>(state_->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
     return state_->current_readers;
   }
 
@@ -14514,7 +14896,7 @@ public:
    * @return True when a writer holds the lock.
    */
   inline bool has_writer() const noexcept {
-    auto lock = std::lock_guard<std::mutex>(state_->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
     return state_->has_writer;
   }
 
@@ -14524,7 +14906,7 @@ public:
    * @return Pending reader count.
    */
   inline std::size_t pending_readers_count() const noexcept {
-    auto lock = std::lock_guard<std::mutex>(state_->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
     return state_->read_waiters.size();
   }
 
@@ -14534,7 +14916,7 @@ public:
    * @return Pending writer count.
    */
   inline std::size_t pending_writers_count() const noexcept {
-    auto lock = std::lock_guard<std::mutex>(state_->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
     return state_->write_waiters.size();
   }
 };
@@ -14556,7 +14938,7 @@ protected:
   inline promise<void> wait_when_not_raised() {
     auto waiter = std::shared_ptr<internal::conditional_waiter>{};
     {
-      auto lock = std::lock_guard<std::mutex>(state_->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
       waiter = std::make_shared<internal::conditional_waiter>();
       state_->waiters.push_back(waiter);
     }
@@ -14573,7 +14955,7 @@ protected:
 
     auto waiter = std::shared_ptr<internal::conditional_waiter>{};
     {
-      auto lock = std::lock_guard<std::mutex>(state_->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
       waiter = std::make_shared<internal::conditional_waiter>();
       state_->waiters.push_back(waiter);
     }
@@ -14630,7 +15012,7 @@ public:
   inline void trigger() {
     auto waiter = std::shared_ptr<internal::conditional_waiter>{};
     {
-      auto lock = std::lock_guard<std::mutex>(state_->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state_->mutex);
       waiter = internal::pop_conditional_waiter(*state_);
     }
 
@@ -14661,7 +15043,7 @@ public:
    */
   inline promise<void> wait() {
     {
-      auto lock = std::lock_guard<std::mutex>(state()->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state()->mutex);
       if (state()->raised) {
         return resolved();
       }
@@ -14680,7 +15062,7 @@ public:
    */
   inline promise<void> wait(cancellation cancellation_signal) {
     {
-      auto lock = std::lock_guard<std::mutex>(state()->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state()->mutex);
       if (state()->raised) {
         return resolved();
       }
@@ -14696,7 +15078,7 @@ public:
   inline void trigger() {
     auto waiter = std::shared_ptr<internal::conditional_waiter>{};
     {
-      auto lock = std::lock_guard<std::mutex>(state()->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state()->mutex);
       state()->raised = false;
       waiter = internal::pop_conditional_waiter(*state());
     }
@@ -14712,7 +15094,7 @@ public:
   inline void raise() {
     auto waiters = std::vector<std::shared_ptr<internal::conditional_waiter>>{};
     {
-      auto lock = std::lock_guard<std::mutex>(state()->mutex);
+      auto lock = std::lock_guard<::cardio::internal::mutex>(state()->mutex);
       state()->raised = true;
       while (auto waiter = internal::pop_conditional_waiter(*state())) {
         waiters.push_back(std::move(waiter));
@@ -14728,7 +15110,7 @@ public:
    * Drops the raised state.
    */
   inline void drop() {
-    auto lock = std::lock_guard<std::mutex>(state()->mutex);
+    auto lock = std::lock_guard<::cardio::internal::mutex>(state()->mutex);
     state()->raised = false;
   }
 };
