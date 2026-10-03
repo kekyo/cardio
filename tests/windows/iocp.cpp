@@ -110,10 +110,12 @@ static void queued_cancellation_and_capacity() {
   auto first_watcher = expect_error(first, ERROR_ACCESS_DENIED);
   auto second_watcher = expect_canceled(second);
   auto overflow_watcher = expect_error(overflow, ERROR_NOT_ENOUGH_QUOTA);
+  CHECK(source.cancel());
+  // Queue the unblock after the operation's cancellation callback. Registering
+  // it before cancel() can release the pump before cancellation reaches it.
   auto unblock = source.get_cancellation().on_cancellation_requested([&] {
     CHECK(::SetEvent(release));
   });
-  CHECK(source.cancel());
   dispatcher.park();
   CHECK(first_watcher.is_ready() && second_watcher.is_ready() && overflow_watcher.is_ready());
   CHECK(::CloseHandle(entered));
