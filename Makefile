@@ -148,7 +148,7 @@ WIN32_SUPPLEMENTAL_DISABLED_CXXFLAGS := $(WIN32_CXXFLAGS) -DCARDIO_WITH_SUPPLEME
 WIN32_PRIMITIVES_DISABLED_TEST_BIN := $(WIN32_BUILD_DIR)/cardio_primitives_disabled_test_no_primitives.exe
 WIN32_PRIMITIVES_DISABLED_CXXFLAGS := $(WIN32_CXXFLAGS) -DCARDIO_WITH_PRIMITIVES=0
 
-.PHONY: all test test-shared test-win32 test-win32-shared test-win32-xp test-android test-android-config test-android-artifacts test-android-runtime test-android-diagnostics clean
+.PHONY: all test test-build test-shared test-win32 test-win32-shared test-win32-xp test-android test-android-config test-android-artifacts test-android-runtime test-android-diagnostics clean
 
 all: $(TEST_BINS) $(NO_EXCEPTIONS_TEST_BIN) $(NO_POSIX_TEST_BIN) $(SUPPLEMENTAL_DISABLED_TEST_BIN) $(PRIMITIVES_DISABLED_TEST_BIN) $(IO_URING_TEST_BINS) $(GLIB_TEST_BINS) $(GIO_TEST_BINS)
 
@@ -282,7 +282,10 @@ else
 test-shared:
 endif
 
-test: $(TEST_BINS) $(NO_EXCEPTIONS_TEST_BIN) $(NO_POSIX_TEST_BIN) $(SUPPLEMENTAL_DISABLED_TEST_BIN) $(PRIMITIVES_DISABLED_TEST_BIN) $(IO_URING_TEST_BINS) $(GLIB_TEST_BINS) $(GIO_TEST_BINS) test-shared test-android-diagnostics
+test-build:
+	sh tests/build_test.sh
+
+test: $(TEST_BINS) $(NO_EXCEPTIONS_TEST_BIN) $(NO_POSIX_TEST_BIN) $(SUPPLEMENTAL_DISABLED_TEST_BIN) $(PRIMITIVES_DISABLED_TEST_BIN) $(IO_URING_TEST_BINS) $(GLIB_TEST_BINS) $(GIO_TEST_BINS) test-shared test-build test-android-diagnostics
 	for test_bin in $(TEST_BINS) $(NO_EXCEPTIONS_TEST_BIN) $(NO_POSIX_TEST_BIN) $(SUPPLEMENTAL_DISABLED_TEST_BIN) $(PRIMITIVES_DISABLED_TEST_BIN) $(IO_URING_TEST_BINS) $(GLIB_TEST_BINS) $(GIO_TEST_BINS); do $$test_bin || exit $$?; done
 
 test-win32-shared: $(WIN32_SHARED_TEST_BIN) $(WIN32_SHARED_PLUGIN) $(WIN32_SHARED_LIBCARDIO)
