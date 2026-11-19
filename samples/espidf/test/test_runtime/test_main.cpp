@@ -8,6 +8,9 @@
 #include "esp_netif.h"
 #include "esp_vfs_eventfd.h"
 #include "loopback.h"
+void ip_event_starts_tcp();
+void drop_wait_during_event_delivery();
+void one_shot_events();
 #endif
 #include <array>
 #include <atomic>
@@ -223,6 +226,9 @@ extern "C" void app_main() {
 #ifndef CARDIO_TEST_CORE_ONLY
   RUN_TEST(tcp_and_eventfd);
   RUN_TEST(earlier_timer_interrupts_select);
+  RUN_TEST(ip_event_starts_tcp);
+  RUN_TEST(drop_wait_during_event_delivery);
+  RUN_TEST(one_shot_events);
 #if CARDIO_HAS_EXCEPTIONS
   RUN_TEST(cancel_and_reuse_fd);
   RUN_TEST(cancellation_races_readiness);

@@ -22,6 +22,10 @@
 #define CARDIO_WITH_GIO 0
 #endif
 
+#ifndef CARDIO_WITH_ESP_EVENT
+#define CARDIO_WITH_ESP_EVENT 0
+#endif
+
 #ifndef CARDIO_WITH_SUPPLEMENTAL
 #define CARDIO_WITH_SUPPLEMENTAL 1
 #endif
@@ -174,6 +178,13 @@
 #if defined(ESP_PLATFORM)
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#endif
+
+#if CARDIO_WITH_ESP_EVENT
+#if !defined(ESP_PLATFORM)
+#error "CARDIO_WITH_ESP_EVENT requires ESP-IDF"
+#endif
+#include <esp_event.h>
 #endif
 
 #if CARDIO_WITH_SUPPLEMENTAL
@@ -445,6 +456,9 @@ class dispatcher_host_glib_auto;
 namespace internal {
 #if defined(__ANDROID__)
   class dispatcher_host_android_base;
+#endif
+#if CARDIO_WITH_ESP_EVENT
+  template <typename T> struct esp_event_subscription;
 #endif
   struct cancellation_callback_entry;
   struct cancellation_state;
@@ -1465,12 +1479,12 @@ namespace internal {
     return (interests & (fd_event::read | fd_event::write)) != fd_event::none;
   }
 
-  inline bool valid_wait_fd(int fd) noexcept {
+  inline const char* fd_range_error(int fd) noexcept {
+    if (fd < 0) return "cardio: file descriptor must not be negative";
 #if defined(ESP_PLATFORM)
-    return fd >= 0 && fd < FD_SETSIZE;
-#else
-    return fd >= 0;
+    if (fd >= FD_SETSIZE) return "cardio: file descriptor must be less than FD_SETSIZE";
 #endif
+    return nullptr;
   }
 
   inline short to_poll_events(fd_event interests) noexcept {
@@ -1583,7 +1597,7 @@ namespace internal {
       if (wakeup_read_fd_ < 0) {
         fail_system_error(errno, "cardio: eventfd failed (register the eventfd VFS before creating a dispatcher)");
       }
-      if (!valid_wait_fd(wakeup_read_fd_)) {
+      if (wakeup_read_fd_ >= FD_SETSIZE) {
         close_fd(wakeup_read_fd_);
         fail_system_error(EMFILE, "cardio: eventfd is outside FD_SETSIZE");
       }
@@ -6966,6 +6980,9 @@ inline auto switch_to(dispatcher& target) noexcept {
 template <typename T> class promise {
 private:
   friend class promise_source<T>;
+#if CARDIO_WITH_ESP_EVENT
+  template <typename> friend struct internal::esp_event_subscription;
+#endif
   friend promise<T> internal::make_resolved_promise<T>(T value);
 #if CARDIO_HAS_EXCEPTIONS
   friend promise<T> internal::make_rejected_promise<T>(
@@ -8546,6 +8563,154 @@ inline promise<T> rejected(Exception exception) {
 }
 #endif
 
+#if CARDIO_WITH_ESP_EVENT
+/**
+ * Result of waiting for one ESP-IDF event.
+ * @tparam T Trivially copyable, default-constructible event payload.
+ */
+template <typename T> struct esp_event_result {
+  /** ESP_OK on delivery, otherwise the ESP-IDF error code. */
+  esp_err_t error = ESP_OK;
+  /** Copy of the posted payload, valid on success. */
+  T value{};
+};
+
+/** Result for an ESP-IDF event whose payload is ignored. */
+template <> struct esp_event_result<void> {
+  /** ESP_OK on delivery, otherwise the ESP-IDF error code. */
+  esp_err_t error = ESP_OK;
+};
+
+namespace internal {
+  template <typename T> struct esp_event_subscription
+      : std::enable_shared_from_this<esp_event_subscription<T>> {
+    using result_type = esp_event_result<T>;
+    promise_source<result_type> source;
+    dispatcher& target = require_current_dispatcher();
+    esp_event_loop_handle_t loop;
+    esp_event_base_t base;
+    int32_t id;
+    mutex registration_mutex;
+    esp_event_handler_instance_t instance = nullptr;
+    cancellation_registration cancel_registration;
+    std::atomic<bool> posted{false};
+
+    esp_event_subscription(esp_event_loop_handle_t loop, esp_event_base_t base, int32_t id)
+        : loop(loop), base(base), id(id) {}
+
+    static void receive(void* arg, esp_event_base_t, int32_t, void* data) {
+      auto& self = *static_cast<esp_event_subscription*>(arg);
+      if (self.posted.exchange(true)) return;
+      result_type result{};
+      if constexpr (!std::is_void_v<T>) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        if (data) {
+          std::memcpy(&result.value, data, sizeof(T));
+        } else {
+          result.error = ESP_ERR_INVALID_ARG;
+        }
+      }
+      // Leave the ESP event-loop callback before unregistering. A wait can be
+      // dropped while this work is queued, in which case the weak reference expires.
+      dangerous_schedule_later__(&self.target, [weak = self.weak_from_this(), result] {
+        if (auto state = weak.lock()) {
+          state->detach();
+          state->source.try_resolve(result);
+        }
+      });
+    }
+
+    esp_err_t attach(const cancellation& token) {
+      auto lock = std::lock_guard<mutex>(registration_mutex);
+      if (!base || id == ESP_EVENT_ANY_ID) {
+        return ESP_ERR_INVALID_ARG;
+      }
+      const auto error = loop
+          ? esp_event_handler_instance_register_with(loop, base, id, receive, this, &instance)
+          : esp_event_handler_instance_register(base, id, receive, this, &instance);
+      if (error == ESP_OK) {
+        cancel_registration = token.on_cancellation_requested([weak = this->weak_from_this()] {
+          if (auto state = weak.lock()) state->cancel();
+        });
+      }
+      return error;
+    }
+
+    void detach() {
+      auto lock = std::lock_guard<mutex>(registration_mutex);
+      if (!instance) return;
+      // The loop serializes unregistration with a running handler. receive()
+      // never takes registration_mutex, even when another core is detaching.
+      if (loop) {
+        esp_event_handler_instance_unregister_with(loop, base, id, instance);
+      } else {
+        esp_event_handler_instance_unregister(base, id, instance);
+      }
+      instance = nullptr;
+      cancel_registration.reset();
+    }
+
+    void cancel() {
+      detach();
+#if CARDIO_HAS_EXCEPTIONS
+      source.try_cancel();
+#else
+      source.try_resolve({ESP_ERR_INVALID_STATE});
+#endif
+    }
+
+    struct owner {
+      std::shared_ptr<esp_event_subscription> state;
+      explicit owner(std::shared_ptr<esp_event_subscription> state) : state(std::move(state)) {}
+      ~owner() {
+        state->detach();
+        // A pending source must be settled even in builds without exceptions.
+        state->source.try_resolve({ESP_ERR_INVALID_STATE});
+      }
+    };
+
+    static promise<result_type> start(esp_event_loop_handle_t loop, esp_event_base_t base,
+                                       int32_t id, const cancellation& token) {
+      auto state = std::make_shared<esp_event_subscription>(loop, base, id);
+      auto lifetime = std::make_shared<owner>(state);
+      auto result = state->source.get_promise();
+      // The consumer's promise owns the registration. The producer keeps the
+      // original shared state, so dropping the consumer can unregister eagerly.
+      result.state_ = decltype(result.state_)(lifetime, result.state_.get());
+      if (token.is_cancellation_requested()) {
+        state->cancel();
+        return result;
+      }
+      const auto error = state->attach(token);
+      if (error != ESP_OK) {
+        state->source.try_resolve({error});
+      }
+      return result;
+    }
+  };
+}  // namespace internal
+
+/**
+ * Waits for a single event on the default or a user-created ESP-IDF event loop.
+ * @tparam T Posted payload type, or void to ignore the payload.
+ * @param base Concrete event base.
+ * @param id Concrete event ID.
+ * @param loop User event loop, or nullptr for the default loop.
+ * @param token Optional cancellation signal.
+ * @return A promise carrying the copied payload and registration or delivery status.
+ * @remarks Use from task context. The loop and dispatcher must outlive the wait.
+ * For non-void T the posted data must contain a complete T. Embedded pointers
+ * keep their original lifetimes. Dropping the promise removes its subscription.
+ * Cancellation raises canceled_exception with exceptions enabled and otherwise
+ * returns ESP_ERR_INVALID_STATE.
+ */
+template <typename T = void>
+inline promise<esp_event_result<T>> from_esp_event(esp_event_base_t base, int32_t id,
+    esp_event_loop_handle_t loop = nullptr, cancellation token = {}) {
+  return internal::esp_event_subscription<T>::start(loop, base, id, token);
+}
+#endif
+
 #if CARDIO_HAS_POSIX_FD
 /**
  * Creates a promise that resolves when a file descriptor becomes ready.
@@ -8558,13 +8723,11 @@ inline promise<T> rejected(Exception exception) {
  * The file descriptor is not owned by the promise and is never closed by it.
  */
 inline promise<fd_event> from_fd(int fd, fd_event interests) {
-  if (!internal::valid_wait_fd(fd)) {
+  if (const auto* error = internal::fd_range_error(fd)) {
 #if CARDIO_HAS_EXCEPTIONS
-    return rejected<fd_event>(std::invalid_argument(
-        "cardio: file descriptor is out of range"));
+    return rejected<fd_event>(std::invalid_argument(error));
 #else
-    internal::fail_invalid_argument(
-        "cardio: file descriptor is out of range");
+    internal::fail_invalid_argument(error);
 #endif
   }
 
@@ -8599,9 +8762,8 @@ inline promise<fd_event> from_fd(
     int fd,
     fd_event interests,
     cancellation cancellation) {
-  if (!internal::valid_wait_fd(fd)) {
-    return rejected<fd_event>(std::invalid_argument(
-        "cardio: file descriptor is out of range"));
+  if (const auto* error = internal::fd_range_error(fd)) {
+    return rejected<fd_event>(std::invalid_argument(error));
   }
 
   if (!internal::has_fd_io_interest(interests)) {
