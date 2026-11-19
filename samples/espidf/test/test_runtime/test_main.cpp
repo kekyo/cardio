@@ -128,16 +128,22 @@ static void tcp_and_eventfd() {
   TEST_ASSERT_GREATER_OR_EQUAL(0, fd);
   auto ready = cardio::from_fd(fd, cardio::fd_event::read);
   auto exchange = loopback_exchange();
+  auto wait_for = [](auto& io) -> cardio::promise<void> { (void)co_await io; };
+  std::vector<cardio::promise<void>> observed;
+  observed.push_back(observe(state, 0, wait_for(exchange)));
+  if constexpr (worker_count > 1) {
+    observed.push_back(observe(state, 1, wait_for(ready)));
+  }
   for (unsigned i = 0; i < worker_count; ++i) {
     TEST_ASSERT_EQUAL(pdPASS, xTaskCreatePinnedToCore(park_worker, "cardio-io", 6144,
-        &state, 3, nullptr, i));
+        &state, 3, &state.handles[i], i));
   }
   const uint64_t signal = 7;
   TEST_ASSERT_EQUAL(sizeof(signal), write(fd, &signal, sizeof(signal)));
-  // Both waits must finish before the park workers are asked to return.
+  // On two cores the socket and eventfd continuations must meet on distinct workers.
   auto finish = [&]() -> cardio::promise<void> {
-    co_await ready;
-    co_await exchange;
+    if constexpr (worker_count == 1) co_await ready;
+    for (auto& work : observed) co_await work;
     state.group.shutdown();
   };
   auto done = finish();
@@ -145,6 +151,7 @@ static void tcp_and_eventfd() {
     ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
   }
   TEST_ASSERT_TRUE(done.is_ready());
+  if constexpr (worker_count > 1) TEST_ASSERT_NOT_EQUAL(state.cores[0], state.cores[1]);
   TEST_ASSERT_TRUE(exchange.unsafe_result());
   TEST_ASSERT_TRUE((ready.unsafe_result() & cardio::fd_event::read) == cardio::fd_event::read);
   uint64_t value = 0;
