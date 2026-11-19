@@ -22,6 +22,10 @@
 #define CARDIO_WITH_GIO 0
 #endif
 
+#ifndef CARDIO_WITH_ESP_EVENT
+#define CARDIO_WITH_ESP_EVENT 0
+#endif
+
 #ifndef CARDIO_WITH_SUPPLEMENTAL
 #define CARDIO_WITH_SUPPLEMENTAL 1
 #endif
@@ -83,8 +87,18 @@
 
 #include <stdlib.h>
 
+#if defined(ESP_PLATFORM)
+#include <sdkconfig.h>
+#endif
+
 #ifndef CARDIO_HAS_POSIX_FD
-#if defined(_POSIX_C_SOURCE) || defined(__ANDROID__)
+#if defined(ESP_PLATFORM)
+#if CONFIG_VFS_SUPPORT_SELECT
+#define CARDIO_HAS_POSIX_FD 1
+#else
+#define CARDIO_HAS_POSIX_FD 0
+#endif
+#elif defined(_POSIX_C_SOURCE) || defined(__ANDROID__)
 #define CARDIO_HAS_POSIX_FD 1
 #else
 #define CARDIO_HAS_POSIX_FD 0
@@ -133,6 +147,7 @@
 #define CARDIO_HAS_NATIVE_WAIT 0
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -160,13 +175,34 @@
 
 #include <thread>
 
+#if defined(ESP_PLATFORM)
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
+
+#if CARDIO_WITH_ESP_EVENT
+#if !defined(ESP_PLATFORM)
+#error "CARDIO_WITH_ESP_EVENT requires ESP-IDF"
+#endif
+#include <esp_event.h>
+#endif
+
 #if CARDIO_WITH_SUPPLEMENTAL
 #include <chrono>
 #endif
 
 #if CARDIO_HAS_POSIX_FD
+#if defined(ESP_PLATFORM)
+#if !CONFIG_VFS_SUPPORT_SELECT
+#error "ESP-IDF file descriptor waits require CONFIG_VFS_SUPPORT_SELECT"
+#endif
+#include <esp_vfs_eventfd.h>
+#include <sys/poll.h>
+#include <sys/select.h>
+#else
 #include <fcntl.h>
 #include <poll.h>
+#endif
 #include <unistd.h>
 #endif
 
@@ -374,16 +410,26 @@ namespace internal {
     thread& operator=(const thread&) = delete;
   };
 
-  inline thread::id current_thread_id() noexcept {
+  using thread_id = thread::id;
+  inline thread_id current_thread_id() noexcept {
     return ::GetCurrentThreadId();
   }
 #else
   using mutex = std::mutex;
   using condition_variable = std::condition_variable;
   using thread = std::thread;
-  inline thread::id current_thread_id() noexcept {
+#if defined(ESP_PLATFORM)
+  // pthread_self() cannot identify an ordinary FreeRTOS task, including app_main.
+  using thread_id = TaskHandle_t;
+  inline thread_id current_thread_id() noexcept {
+    return xTaskGetCurrentTaskHandle();
+  }
+#else
+  using thread_id = thread::id;
+  inline thread_id current_thread_id() noexcept {
     return std::this_thread::get_id();
   }
+#endif
 #endif
 }  // namespace internal
 
@@ -410,6 +456,9 @@ class dispatcher_host_glib_auto;
 namespace internal {
 #if defined(__ANDROID__)
   class dispatcher_host_android_base;
+#endif
+#if CARDIO_WITH_ESP_EVENT
+  template <typename T> struct esp_event_subscription;
 #endif
   struct cancellation_callback_entry;
   struct cancellation_state;
@@ -1430,6 +1479,14 @@ namespace internal {
     return (interests & (fd_event::read | fd_event::write)) != fd_event::none;
   }
 
+  inline const char* fd_range_error(int fd) noexcept {
+    if (fd < 0) return "cardio: file descriptor must not be negative";
+#if defined(ESP_PLATFORM)
+    if (fd >= FD_SETSIZE) return "cardio: file descriptor must be less than FD_SETSIZE";
+#endif
+    return nullptr;
+  }
+
   inline short to_poll_events(fd_event interests) noexcept {
     auto events = short{};
     if ((interests & fd_event::read) != fd_event::none) {
@@ -1462,7 +1519,9 @@ namespace internal {
   private:
     std::deque<std::shared_ptr<fd_wait_state>> waits_;
     int wakeup_read_fd_ = -1;
+#if !defined(ESP_PLATFORM)
     int wakeup_write_fd_ = -1;
+#endif
 
     static inline void close_fd(int& fd) noexcept {
       if (fd < 0) {
@@ -1473,6 +1532,7 @@ namespace internal {
       fd = -1;
     }
 
+#if !defined(ESP_PLATFORM)
     static inline void set_fd_flags(int fd) {
       auto flags = ::fcntl(fd, F_GETFL, 0);
       if (flags == -1) {
@@ -1493,7 +1553,14 @@ namespace internal {
       }
     }
 
+#endif
+
     inline void drain_wakeup() noexcept {
+#if defined(ESP_PLATFORM)
+      uint64_t counter;
+      // One eventfd read consumes the accumulated notifications.
+      while (::read(wakeup_read_fd_, &counter, sizeof(counter)) < 0 && errno == EINTR) {}
+#else
       char buffer[64]{};
       while (true) {
         const auto result = ::read(wakeup_read_fd_, buffer, sizeof(buffer));
@@ -1511,6 +1578,7 @@ namespace internal {
         }
         return;
       }
+#endif
     }
 
   public:
@@ -1524,6 +1592,16 @@ namespace internal {
     };
 
     inline posix_fd_wait_backend() {
+#if defined(ESP_PLATFORM)
+      wakeup_read_fd_ = ::eventfd(0, 0);
+      if (wakeup_read_fd_ < 0) {
+        fail_system_error(errno, "cardio: eventfd failed (register the eventfd VFS before creating a dispatcher)");
+      }
+      if (wakeup_read_fd_ >= FD_SETSIZE) {
+        close_fd(wakeup_read_fd_);
+        fail_system_error(EMFILE, "cardio: eventfd is outside FD_SETSIZE");
+      }
+#else
       int fds[2]{-1, -1};
       if (::pipe(fds) == -1) {
         fail_system_error(errno, "cardio: pipe failed");
@@ -1550,11 +1628,14 @@ namespace internal {
       fds[0] = -1;
       fds[1] = -1;
 #endif
+#endif
     }
 
     inline ~posix_fd_wait_backend() {
       close_fd(wakeup_read_fd_);
+#if !defined(ESP_PLATFORM)
       close_fd(wakeup_write_fd_);
+#endif
     }
 
     posix_fd_wait_backend(const posix_fd_wait_backend&) = delete;
@@ -1565,10 +1646,16 @@ namespace internal {
     }
 
     inline void notify() noexcept {
+#if defined(ESP_PLATFORM)
+      const auto value = uint64_t{1};
+      const int fd = wakeup_read_fd_;
+#else
       const auto value = char{1};
+      const int fd = wakeup_write_fd_;
+#endif
       while (true) {
-        const auto result = ::write(wakeup_write_fd_, &value, 1);
-        if (result == 1) {
+        const auto result = ::write(fd, &value, sizeof(value));
+        if (result == sizeof(value)) {
           return;
         }
         if (result == -1 && errno == EINTR) {
@@ -1644,22 +1731,42 @@ namespace internal {
       return result;
     }
 
-    static inline void wait(snapshot& snapshot) {
-      if (snapshot.empty()) {
-        return;
+    static inline void wait(std::vector<pollfd>& fds, int timeout_milliseconds) {
+#if defined(ESP_PLATFORM)
+      fd_set readers, writers, errors;
+      FD_ZERO(&readers);
+      FD_ZERO(&writers);
+      FD_ZERO(&errors);
+      int nfds = 0;
+      for (auto& entry : fds) {
+        entry.revents = 0;
+        if (entry.events & POLLIN) FD_SET(entry.fd, &readers);
+        if (entry.events & POLLOUT) FD_SET(entry.fd, &writers);
+        FD_SET(entry.fd, &errors);
+        nfds = std::max(nfds, entry.fd + 1);
       }
-
-      auto poll_result = int{};
+      timeval timeout{timeout_milliseconds / 1000, (timeout_milliseconds % 1000) * 1000};
+      const int ready = ::select(nfds, &readers, &writers, &errors,
+                                 timeout_milliseconds < 0 ? nullptr : &timeout);
+      if (ready < 0 && errno != EINTR) {
+        fail_system_error(errno, "cardio: select failed");
+      }
+      if (ready <= 0) return;  // park() recomputes the deadline after an interrupt.
+      for (auto& entry : fds) {
+        // Several independent waits may request different interests on one fd.
+        if ((entry.events & POLLIN) && FD_ISSET(entry.fd, &readers)) entry.revents |= POLLIN;
+        if ((entry.events & POLLOUT) && FD_ISSET(entry.fd, &writers)) entry.revents |= POLLOUT;
+        if (FD_ISSET(entry.fd, &errors)) entry.revents |= POLLERR;
+      }
+#else
+      int result;
       do {
-        poll_result = ::poll(
-            snapshot.poll_fds.data(),
-            static_cast<nfds_t>(snapshot.poll_fds.size()),
-            -1);
-      } while (poll_result == -1 && errno == EINTR);
-
-      if (poll_result == -1) {
+        result = ::poll(fds.data(), static_cast<nfds_t>(fds.size()), timeout_milliseconds);
+      } while (result == -1 && errno == EINTR);
+      if (result == -1) {
         fail_system_error(errno, "cardio: poll failed");
       }
+#endif
     }
 
     inline std::vector<std::coroutine_handle<>> collect_ready(
@@ -2791,7 +2898,7 @@ private:
   friend struct internal::cancellation_state;
 
   dispatcher_feature features_ = dispatcher_feature::none;
-  internal::thread::id owner_thread_id_{};
+  internal::thread_id owner_thread_id_{};
   std::unique_ptr<dispatcher_group> owned_group_;
   dispatcher_group* group_ = nullptr;
   std::shared_ptr<internal::dispatcher_lifetime> lifetime_;
@@ -2828,7 +2935,7 @@ private:
   std::size_t active_continuations_ = 0;
 #if CARDIO_HAS_NATIVE_WAIT
   bool wait_polling_ = false;
-  ::cardio::internal::thread::id wait_polling_thread_id_{};
+  ::cardio::internal::thread_id wait_polling_thread_id_{};
 #endif
 #if CARDIO_HAS_EXCEPTIONS
   std::function<void(std::exception_ptr)> unhandled_exception_;
@@ -2889,7 +2996,7 @@ private:
   inline void mark_wait_polling(bool polling) noexcept {
     wait_polling_ = polling;
     wait_polling_thread_id_ =
-        polling ? ::cardio::internal::current_thread_id() : ::cardio::internal::thread::id{};
+        polling ? ::cardio::internal::current_thread_id() : ::cardio::internal::thread_id{};
   }
 
   inline bool should_notify_native_wait_from_current_thread() const noexcept {
@@ -3144,17 +3251,7 @@ private:
     }
 
 #if CARDIO_HAS_POSIX_FD
-    auto poll_result = int{};
-    do {
-      poll_result = ::poll(
-          snapshot.poll_fds.data(),
-          static_cast<nfds_t>(snapshot.poll_fds.size()),
-          timeout_milliseconds);
-    } while (poll_result == -1 && errno == EINTR);
-
-    if (poll_result == -1) {
-      internal::fail_system_error(errno, "cardio: poll failed");
-    }
+    internal::fd_wait_backend::wait(snapshot.poll_fds, timeout_milliseconds);
 
     for (auto index = std::size_t{0};
          index < snapshot.fd_snapshot.poll_fds.size(); ++index) {
@@ -3499,7 +3596,15 @@ private:
     auto notify_native_wait = false;
 #endif
     {
-      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
+      auto lock = std::unique_lock<::cardio::internal::mutex>(mutex_);
+#if CARDIO_HAS_EXCEPTIONS
+      if (wait->canceled) {
+        wait->owner = nullptr;
+        lock.unlock();
+        enqueue(continuation);
+        return;
+      }
+#endif
 #if CARDIO_HAS_NATIVE_WAIT
       const auto previous_deadline = next_timer_deadline();
 #endif
@@ -3611,8 +3716,10 @@ private:
     auto unregistered = false;
     {
       auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
-      if (wait && wait->owner == this && wait->registered) {
+      if (wait && wait->owner == this) {
         wait->canceled = true;
+        // A cancellation callback may run just before the timer enters the heap.
+        if (!wait->registered) return;
         continuation = wait->continuation;
         wait->owner = nullptr;
         wait->registered = false;
@@ -3624,11 +3731,10 @@ private:
     }
 
     if (unregistered) {
-      condition_.notify_one();
+      notify();
       if (continuation) {
         enqueue(continuation);
       }
-      notify_external_event();
     }
   }
 #endif
@@ -3639,7 +3745,14 @@ private:
       std::coroutine_handle<> continuation) {
     auto notify_native_wait = false;
     {
-      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
+      auto lock = std::unique_lock<::cardio::internal::mutex>(mutex_);
+#if CARDIO_HAS_EXCEPTIONS
+      if (wait->canceled) {
+        lock.unlock();
+        enqueue(continuation);
+        return;
+      }
+#endif
       fd_waits_.register_wait(this, std::move(wait), continuation);
       notify_native_wait = should_notify_native_wait_from_current_thread();
     }
@@ -3677,6 +3790,11 @@ private:
     auto notify_native_wait = false;
     {
       auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
+      // Cancellation can arrive between installing its callback and publishing the wait.
+      if (wait && !wait->continuation) {
+        wait->canceled = true;
+        return;
+      }
       if (wait && wait->owner == this && wait->registered) {
         wait->canceled = true;
         continuation = wait->continuation;
@@ -3880,7 +3998,7 @@ public:
    * an unbound dispatcher or a call from another thread.
    */
   inline bool is_current_thread_owner() const noexcept {
-    return owner_thread_id_ != internal::thread::id{} &&
+    return owner_thread_id_ != internal::thread_id{} &&
            owner_thread_id_ == internal::current_thread_id();
   }
 
@@ -4001,7 +4119,7 @@ public:
   inline void park(
       shutdown_mode mode = shutdown_mode::gentle,
       park_policy policy = park_policy::external_pump_first) {
-    if (owner_thread_id_ != internal::thread::id{} &&
+    if (owner_thread_id_ != internal::thread_id{} &&
         !is_current_thread_owner()) {
       internal::fail_runtime_error(
           "cardio: thread-bound dispatcher must be parked on its owner thread");
@@ -4097,7 +4215,7 @@ public:
             condition_.wait_until(lock, *timer_deadline);
           } else {
             condition_.wait(lock, [this, mode] {
-              return !queue_.empty() || group_->should_exit(mode);
+              return !queue_.empty() || !timer_waits_.empty() || group_->should_exit(mode);
             });
           }
 #endif
@@ -4129,7 +4247,7 @@ public:
         if (!queue_.empty()) {
 #if CARDIO_HAS_NATIVE_WAIT
           shutdown_wait_probe_done = false;
-          mark_wait_polling(false);
+          // Another park worker can still own the native wait snapshot.
 #endif
           work = std::move(queue_.front());
           queue_.pop_front();
@@ -4292,7 +4410,7 @@ namespace internal {
     std::vector<looper_registration> wait_registrations_;
     dispatcher::wait_snapshot looper_wait_snapshot_;
     bool looper_wait_snapshot_valid_ = false;
-    ::cardio::internal::thread::id owner_thread_;
+    ::cardio::internal::thread_id owner_thread_;
     shutdown_mode active_shutdown_mode_ = shutdown_mode::gentle;
     bool parked_ = false;
 
@@ -6457,17 +6575,16 @@ namespace internal {
       }
 #endif
 
-      current.register_timer_wait(state, continuation_handle);
-
 #if CARDIO_HAS_EXCEPTIONS
+      state->owner = &current;
       (void)cancellation_.try_register_callback(
           [target = &current, wait = state] {
-            wait->cancellation_registration_.reset();
             target->cancel_timer_wait(wait);
           },
           state->cancellation_registration_);
 #endif
-
+      // Install cancellation before another park worker can take the timer.
+      current.register_timer_wait(state, continuation_handle);
       return true;
     }
 
@@ -6564,17 +6681,15 @@ namespace internal {
       }
 #endif
 
-      current.register_fd_wait(state, continuation_handle);
-
 #if CARDIO_HAS_EXCEPTIONS
       (void)cancellation_.try_register_callback(
           [target = &current, wait = state] {
-            wait->cancellation_registration_.reset();
             target->cancel_fd_wait(wait);
           },
           state->cancellation_registration_);
 #endif
-
+      // A different park worker can resume and destroy this awaiter as soon as it is registered.
+      current.register_fd_wait(state, continuation_handle);
       return true;
     }
 
@@ -6873,6 +6988,9 @@ inline auto switch_to(dispatcher& target) noexcept {
 template <typename T> class promise {
 private:
   friend class promise_source<T>;
+#if CARDIO_WITH_ESP_EVENT
+  template <typename> friend struct internal::esp_event_subscription;
+#endif
   friend promise<T> internal::make_resolved_promise<T>(T value);
 #if CARDIO_HAS_EXCEPTIONS
   friend promise<T> internal::make_rejected_promise<T>(
@@ -8453,6 +8571,154 @@ inline promise<T> rejected(Exception exception) {
 }
 #endif
 
+#if CARDIO_WITH_ESP_EVENT
+/**
+ * Result of waiting for one ESP-IDF event.
+ * @tparam T Trivially copyable, default-constructible event payload.
+ */
+template <typename T> struct esp_event_result {
+  /** ESP_OK on delivery, otherwise the ESP-IDF error code. */
+  esp_err_t error = ESP_OK;
+  /** Copy of the posted payload, valid on success. */
+  T value{};
+};
+
+/** Result for an ESP-IDF event whose payload is ignored. */
+template <> struct esp_event_result<void> {
+  /** ESP_OK on delivery, otherwise the ESP-IDF error code. */
+  esp_err_t error = ESP_OK;
+};
+
+namespace internal {
+  template <typename T> struct esp_event_subscription
+      : std::enable_shared_from_this<esp_event_subscription<T>> {
+    using result_type = esp_event_result<T>;
+    promise_source<result_type> source;
+    dispatcher& target = require_current_dispatcher();
+    esp_event_loop_handle_t loop;
+    esp_event_base_t base;
+    int32_t id;
+    mutex registration_mutex;
+    esp_event_handler_instance_t instance = nullptr;
+    cancellation_registration cancel_registration;
+    std::atomic<bool> posted{false};
+
+    esp_event_subscription(esp_event_loop_handle_t loop, esp_event_base_t base, int32_t id)
+        : loop(loop), base(base), id(id) {}
+
+    static void receive(void* arg, esp_event_base_t, int32_t, void* data) {
+      auto& self = *static_cast<esp_event_subscription*>(arg);
+      if (self.posted.exchange(true)) return;
+      result_type result{};
+      if constexpr (!std::is_void_v<T>) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        if (data) {
+          std::memcpy(&result.value, data, sizeof(T));
+        } else {
+          result.error = ESP_ERR_INVALID_ARG;
+        }
+      }
+      // Leave the ESP event-loop callback before unregistering. A wait can be
+      // dropped while this work is queued, in which case the weak reference expires.
+      dangerous_schedule_later__(&self.target, [weak = self.weak_from_this(), result] {
+        if (auto state = weak.lock()) {
+          state->detach();
+          state->source.try_resolve(result);
+        }
+      });
+    }
+
+    esp_err_t attach(const cancellation& token) {
+      auto lock = std::lock_guard<mutex>(registration_mutex);
+      if (!base || id == ESP_EVENT_ANY_ID) {
+        return ESP_ERR_INVALID_ARG;
+      }
+      const auto error = loop
+          ? esp_event_handler_instance_register_with(loop, base, id, receive, this, &instance)
+          : esp_event_handler_instance_register(base, id, receive, this, &instance);
+      if (error == ESP_OK) {
+        cancel_registration = token.on_cancellation_requested([weak = this->weak_from_this()] {
+          if (auto state = weak.lock()) state->cancel();
+        });
+      }
+      return error;
+    }
+
+    void detach() {
+      auto lock = std::lock_guard<mutex>(registration_mutex);
+      if (!instance) return;
+      // The loop serializes unregistration with a running handler. receive()
+      // never takes registration_mutex, even when another core is detaching.
+      if (loop) {
+        esp_event_handler_instance_unregister_with(loop, base, id, instance);
+      } else {
+        esp_event_handler_instance_unregister(base, id, instance);
+      }
+      instance = nullptr;
+      cancel_registration.reset();
+    }
+
+    void cancel() {
+      detach();
+#if CARDIO_HAS_EXCEPTIONS
+      source.try_cancel();
+#else
+      source.try_resolve({ESP_ERR_INVALID_STATE});
+#endif
+    }
+
+    struct owner {
+      std::shared_ptr<esp_event_subscription> state;
+      explicit owner(std::shared_ptr<esp_event_subscription> state) : state(std::move(state)) {}
+      ~owner() {
+        state->detach();
+        // A pending source must be settled even in builds without exceptions.
+        state->source.try_resolve({ESP_ERR_INVALID_STATE});
+      }
+    };
+
+    static promise<result_type> start(esp_event_loop_handle_t loop, esp_event_base_t base,
+                                       int32_t id, const cancellation& token) {
+      auto state = std::make_shared<esp_event_subscription>(loop, base, id);
+      auto lifetime = std::make_shared<owner>(state);
+      auto result = state->source.get_promise();
+      // The consumer's promise owns the registration. The producer keeps the
+      // original shared state, so dropping the consumer can unregister eagerly.
+      result.state_ = decltype(result.state_)(lifetime, result.state_.get());
+      if (token.is_cancellation_requested()) {
+        state->cancel();
+        return result;
+      }
+      const auto error = state->attach(token);
+      if (error != ESP_OK) {
+        state->source.try_resolve({error});
+      }
+      return result;
+    }
+  };
+}  // namespace internal
+
+/**
+ * Waits for a single event on the default or a user-created ESP-IDF event loop.
+ * @tparam T Posted payload type, or void to ignore the payload.
+ * @param base Concrete event base.
+ * @param id Concrete event ID.
+ * @param loop User event loop, or nullptr for the default loop.
+ * @param token Optional cancellation signal.
+ * @return A promise carrying the copied payload and registration or delivery status.
+ * @remarks Use from task context. The loop and dispatcher must outlive the wait.
+ * For non-void T the posted data must contain a complete T. Embedded pointers
+ * keep their original lifetimes. Dropping the promise removes its subscription.
+ * Cancellation raises canceled_exception with exceptions enabled and otherwise
+ * returns ESP_ERR_INVALID_STATE.
+ */
+template <typename T = void>
+inline promise<esp_event_result<T>> from_esp_event(esp_event_base_t base, int32_t id,
+    esp_event_loop_handle_t loop = nullptr, cancellation token = {}) {
+  return internal::esp_event_subscription<T>::start(loop, base, id, token);
+}
+#endif
+
 #if CARDIO_HAS_POSIX_FD
 /**
  * Creates a promise that resolves when a file descriptor becomes ready.
@@ -8465,13 +8731,11 @@ inline promise<T> rejected(Exception exception) {
  * The file descriptor is not owned by the promise and is never closed by it.
  */
 inline promise<fd_event> from_fd(int fd, fd_event interests) {
-  if (fd < 0) {
+  if (const auto* error = internal::fd_range_error(fd)) {
 #if CARDIO_HAS_EXCEPTIONS
-    return rejected<fd_event>(std::invalid_argument(
-        "cardio: file descriptor must not be negative"));
+    return rejected<fd_event>(std::invalid_argument(error));
 #else
-    internal::fail_invalid_argument(
-        "cardio: file descriptor must not be negative");
+    internal::fail_invalid_argument(error);
 #endif
   }
 
@@ -8506,9 +8770,8 @@ inline promise<fd_event> from_fd(
     int fd,
     fd_event interests,
     cancellation cancellation) {
-  if (fd < 0) {
-    return rejected<fd_event>(std::invalid_argument(
-        "cardio: file descriptor must not be negative"));
+  if (const auto* error = internal::fd_range_error(fd)) {
+    return rejected<fd_event>(std::invalid_argument(error));
   }
 
   if (!internal::has_fd_io_interest(interests)) {
