@@ -210,6 +210,36 @@ static void cancellation_races_readiness() {
   TEST_ASSERT_EQUAL_UINT(1, completions);
   vEventGroupDelete(state.events);
 }
+
+static void cancellation_races_timer_expiry() {
+  for (unsigned round = 0; round < 12; ++round) {
+    workers state;
+    cardio::cancellation_source cancel;
+    unsigned completions = 0;
+    auto observe_timer = [&]() -> cardio::promise<void> {
+      try { co_await cardio::promises::delay(1, cancel.get_cancellation()); }
+      catch (const cardio::canceled_exception&) {}
+      ++completions;
+      state.group.shutdown();
+    };
+    auto work = observe_timer();
+    for (unsigned core = 0; core < worker_count; ++core) {
+      TEST_ASSERT_EQUAL(pdPASS, xTaskCreatePinnedToCore([](void* arg) {
+        auto& state = *static_cast<workers*>(arg);
+        xEventGroupWaitBits(state.events, BIT12, pdFALSE, pdTRUE, portMAX_DELAY);
+        park_worker(arg);
+      }, "timer-race", 6144, &state, 3, nullptr, core));
+    }
+    // Let the deadline expire before two park workers can claim the timer and cancellation.
+    cancel.cancel();
+    vTaskDelay(pdMS_TO_TICKS(1) + 2);
+    xEventGroupSetBits(state.events, BIT12);
+    for (unsigned i = 0; i < worker_count; ++i) ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
+    TEST_ASSERT_TRUE(work.is_ready());
+    TEST_ASSERT_EQUAL_UINT(1, completions);
+    vEventGroupDelete(state.events);
+  }
+}
 #endif
 #endif
 
@@ -232,6 +262,7 @@ extern "C" void app_main() {
 #if CARDIO_HAS_EXCEPTIONS
   RUN_TEST(cancel_and_reuse_fd);
   RUN_TEST(cancellation_races_readiness);
+  RUN_TEST(cancellation_races_timer_expiry);
 #endif
 #endif
   std::printf("app_main stack free: %u bytes\n",

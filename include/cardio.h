@@ -3596,7 +3596,15 @@ private:
     auto notify_native_wait = false;
 #endif
     {
-      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
+      auto lock = std::unique_lock<::cardio::internal::mutex>(mutex_);
+#if CARDIO_HAS_EXCEPTIONS
+      if (wait->canceled) {
+        wait->owner = nullptr;
+        lock.unlock();
+        enqueue(continuation);
+        return;
+      }
+#endif
 #if CARDIO_HAS_NATIVE_WAIT
       const auto previous_deadline = next_timer_deadline();
 #endif
@@ -3708,8 +3716,10 @@ private:
     auto unregistered = false;
     {
       auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
-      if (wait && wait->owner == this && wait->registered) {
+      if (wait && wait->owner == this) {
         wait->canceled = true;
+        // A cancellation callback may run just before the timer enters the heap.
+        if (!wait->registered) return;
         continuation = wait->continuation;
         wait->owner = nullptr;
         wait->registered = false;
@@ -3721,11 +3731,10 @@ private:
     }
 
     if (unregistered) {
-      condition_.notify_one();
+      notify();
       if (continuation) {
         enqueue(continuation);
       }
-      notify_external_event();
     }
   }
 #endif
@@ -6566,17 +6575,16 @@ namespace internal {
       }
 #endif
 
-      current.register_timer_wait(state, continuation_handle);
-
 #if CARDIO_HAS_EXCEPTIONS
+      state->owner = &current;
       (void)cancellation_.try_register_callback(
           [target = &current, wait = state] {
-            wait->cancellation_registration_.reset();
             target->cancel_timer_wait(wait);
           },
           state->cancellation_registration_);
 #endif
-
+      // Install cancellation before another park worker can take the timer.
+      current.register_timer_wait(state, continuation_handle);
       return true;
     }
 
