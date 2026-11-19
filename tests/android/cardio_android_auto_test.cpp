@@ -237,9 +237,11 @@ Java_com_example_cardio_CardioActivity_nativeHandlerRan(
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_cardio_CardioActivity_nativeStop(
     JNIEnv* environment,
-    jobject) {
+    jobject activity) {
   auto* target = state;
-  if (target == nullptr) {
+  // A finished Activity can receive onDestroy after its successor starts.
+  if (target == nullptr ||
+      environment->IsSameObject(target->activity, activity) == JNI_FALSE) {
     return;
   }
   state = nullptr;

@@ -10,6 +10,7 @@ import java.util.concurrent.TimeUnit;
 public final class CardioActivity extends Activity {
   private static CountDownLatch completion;
   private static volatile String failure;
+  private static volatile CardioActivity previousActivity;
 
   private Handler handler;
 
@@ -17,9 +18,10 @@ public final class CardioActivity extends Activity {
     System.loadLibrary("cardio_android_auto_test");
   }
 
-  static synchronized void prepareTest() {
+  static synchronized void prepareTest(CardioActivity previous) {
     completion = new CountDownLatch(1);
     failure = null;
+    previousActivity = previous;
   }
 
   static String awaitTest() throws InterruptedException {
@@ -41,6 +43,8 @@ public final class CardioActivity extends Activity {
   @Override
   protected void onCreate(Bundle state) {
     super.onCreate(state);
+    final CardioActivity previous = previousActivity;
+    previousActivity = null;
     handler = new Handler(Looper.getMainLooper());
     if (Looper.myLooper() != Looper.getMainLooper()) {
       completeFromJava("activity was not created on the Java UI thread");
@@ -52,6 +56,10 @@ public final class CardioActivity extends Activity {
       public void run() {
         try {
           nativeStart();
+          if (previous != null) {
+            // Replay the finished Activity's cleanup while its successor is running.
+            previous.nativeStop();
+          }
           if (!handler.post(new Runnable() {
             @Override
             public void run() {

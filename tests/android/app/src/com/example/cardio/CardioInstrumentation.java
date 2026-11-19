@@ -18,16 +18,17 @@ public final class CardioInstrumentation extends Instrumentation {
   public void onStart() {
     final Bundle results = new Bundle();
     int resultCode = Activity.RESULT_CANCELED;
-    Activity activity = null;
+    CardioActivity activity = null;
+    CardioActivity previous = null;
 
     try {
       for (int iteration = 0; iteration < 8; ++iteration) {
-        CardioActivity.prepareTest();
+        CardioActivity.prepareTest(previous);
         final Intent intent = new Intent(Intent.ACTION_MAIN);
         intent.setClassName(
             getTargetContext(), CardioActivity.class.getName());
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        activity = startActivitySync(intent);
+        activity = (CardioActivity) startActivitySync(intent);
 
         final String failure = CardioActivity.awaitTest();
         if (failure != null) {
@@ -43,6 +44,7 @@ public final class CardioInstrumentation extends Instrumentation {
           }
         });
         waitForIdleSync();
+        previous = activity;
         activity = null;
       }
 
