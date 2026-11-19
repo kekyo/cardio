@@ -2,7 +2,7 @@
 
 ## Multithreaded Continuation Workers
 
-In the examples so far, `park()` has always run on the main thread.
+In the [basic usage example](./getting-started.md), `park()` runs on the main thread.
 `dispatcher_host` can call `park()` from multiple threads:
 
 ```cpp

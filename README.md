@@ -29,6 +29,9 @@ C++20 asynchronous programming supports syntax that can be written simply, much 
 With this library, asynchronous processing can be written as simply as follows:
 
 ```cpp
+#include <stdio.h>
+#include "cardio.h"
+
 // Async function (returns a promise)
 static cardio::promise<int> add_async(int a, int b) {
   co_return a + b;  // Can 'co_return'

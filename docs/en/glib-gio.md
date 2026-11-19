@@ -25,8 +25,8 @@ g++ -std=c++20 -Iinclude -DCARDIO_WITH_GLIB=1 app.cpp -o app $(pkg-config --cfla
 
 GLib integration uses `dispatcher_group_glib`, `dispatcher_host_glib`, and
 `dispatcher_host_glib_auto`.
-`dispatcher_group_glib` manages the application's shutdown timing
-(`dispatcher_group` is described later):
+`dispatcher_group_glib` manages the application's shutdown timing. For the role of
+`dispatcher_group`, see [Switching Dispatchers](./dispatchers.md#switching-dispatchers).
 
 ```cpp
 int main() {

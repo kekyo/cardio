@@ -20,7 +20,7 @@ g++ -std=c++20 -Iinclude -DCARDIO_WITH_GLIB=1 app.cpp -o app $(pkg-config --cfla
 ```
 
 GLib統合では、 `dispatcher_group_glib`、`dispatcher_host_glib`、`dispatcher_host_glib_auto` を使用します。
-`dispatcher_group_glib` は、アプリケーションの終了タイミングを管理します（`dispatcher_group` については後述）:
+`dispatcher_group_glib` は、アプリケーションの終了タイミングを管理します。`dispatcher_group` の役割は[dispatcherの切り替え](./dispatchers.md#dispatcherの切り替え)を参照してください。
 
 ```cpp
 int main() {

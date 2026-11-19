@@ -96,7 +96,7 @@ Using `cancellation::on_cancellation_requested()` gives you an opportunity to ru
 a callback when cancellation is requested.
 
 The following example adds complete cancellation handling to the asynchronous
-wrapper function shown in the previous chapter:
+wrapper function shown in [Working With Promises](./promises.md#working-with-promises).
 
 ```cpp
 // The remote API is a C entry point, so define a structure for passing state.

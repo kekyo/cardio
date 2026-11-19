@@ -86,7 +86,7 @@ int main() {
   io_uring and return `promise<std::size_t>`, which returns the actual read or
   write size on completion.
   Other supplemental functions cover fsync, open/close/statx, and path mutation
-  operations. See the supplemental functions section.
+  operations. See [Supplemental Functions](./helpers-and-primitives.md#supplemental-functions).
 - Path-based helpers copy path strings and keep them alive until completion.
 - In exception-enabled builds, `cancellation` can be passed to all io_uring
   helpers.

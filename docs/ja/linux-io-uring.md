@@ -79,7 +79,7 @@ int main() {
 - `cardio::io_uring` はキューを所有し、dispatcherとの連携を行います。
 - `io.submit<T>()` と `cardio::io_urings::submit()` を使用すると、liburingのSQE準備関数を直接使って単発のoperationを投入できます。
 - `cardio::io_urings::read()` と `cardio::io_urings::write()` は、io_uringへI/O要求を投入し、完了時に実際の読み書きサイズを返す `promise<std::size_t>` を返します。
-  その他に、fsync、open/close/statx、パス変更operationを扱う関数が定義されています。補助関数の章を参照して下さい。
+  その他に、fsync、open/close/statx、パス変更operationを扱う関数が定義されています。[補助関数](./helpers-and-primitives.md#補助関数)を参照してください。
 - パスを受け取る補助関数は、path文字列をコピーして完了まで保持します。
 - 例外有効ビルドでは、すべてのio_uring補助関数に `cancellation` を渡せます。
   キャンセル時は返されたpromiseを `canceled_exception` で失敗完了させ、可能であればio_uringへcancel要求を投入します。

@@ -65,8 +65,8 @@ libraries with 16 KiB ZIP alignment. The application remains responsible for
 ensuring that all of its native dependencies and APIs are compatible with its
 declared `minSdkVersion`.
 
-The implementation and validation matrix are documented in
-[`docs/android.md`](../../docs/android.md).
+The [public header](../../include/cardio.h) contains the Android dispatcher implementation.
+The [Android CI configuration](../../.github/workflows/ci.yml) lists the API levels and page sizes used for testing.
 
 ---
 

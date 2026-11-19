@@ -141,8 +141,7 @@ Therefore, asynchronous entry-point functions such as `main_async()` should
 catch and handle all exceptions inside the asynchronous function as much as
 possible, rather than relying on the `unhandled_exception()` hook.
 
-Note: Code examples in this document omit exception handling unless it is
-necessary.
+Code examples throughout these guides omit exception handling unless it is necessary.
 
 ---
 

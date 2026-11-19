@@ -26,6 +26,9 @@ C++20の非同期処理は、TypeScript/JavaScriptのように、簡単に記述
 このライブラリを使用すれば、以下のように簡単に非同期処理を記述できるようになります:
 
 ```cpp
+#include <stdio.h>
+#include "cardio.h"
+
 // 非同期関数(promiseを返す)
 static cardio::promise<int> add_async(int a, int b) {
   co_return a + b;  // co_return出来る

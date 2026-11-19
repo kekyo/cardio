@@ -45,7 +45,7 @@ Java_com_example_App_nativeStop(JNIEnv*, jobject) {
 
 cardioはヘッダーオンリーなので、配布するnative成果物にAPIレベルやページサイズの次元を追加しません。通常、アプリケーションは `x86_64` や `arm64-v8a` などのABIごとに、API 24を最低ターゲットとした最終nativeバイナリを1つずつ生成します。同じバイナリを4 KiBと16 KiBの両方のページサイズでロード可能にするには、例えば `-Wl,-z,max-page-size=16384` を指定し、すべてのnative依存関係を含めて16 KiB互換でリンクしてください。非圧縮nativeライブラリを含むパッケージも16 KiB境界にZIP alignmentする必要があります。宣言した `minSdkVersion` に対して、使用するAPIとすべてのnative依存関係が互換であることはアプリケーション側の責任です。
 
-実装方針と検証マトリックスの詳細は [`docs/android.md`](../../docs/android.md) を参照してください。
+Android用dispatcherの実装は[公開ヘッダー](../../include/cardio.h)にあります。検証に使うAPIレベルとページサイズは[AndroidのCI設定](../../.github/workflows/ci.yml)を参照してください。
 
 ---
 
