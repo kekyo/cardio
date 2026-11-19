@@ -343,6 +343,16 @@ test-android-artifacts: $(ANDROID_X86_64_MANUAL_TEST_BIN) $(ANDROID_ARM64_MANUAL
 	@$(UNZIP) -Z1 $(ANDROID_ARM64_AUTO_TEST_APK) | grep -Fqx "lib/arm64-v8a/libcardio_android_auto_test.so"
 	@echo "cardio_android_artifacts_test: PASS"
 
+ESPIDF_ENV ?= esp32s3
+.PHONY: test-espidf test-espidf-hw
+test-espidf:
+	bash tests/espidf/hardware_selection_test.sh
+	pio test -d samples/espidf -e "$(ESPIDF_ENV)" --without-uploading --without-testing
+	node tests/espidf/run-qemu.mjs "samples/espidf/.pio/build/$(ESPIDF_ENV)"
+
+test-espidf-hw:
+	bash tests/espidf/run-hardware.sh
+
 test-android: test-android-config test-android-artifacts
 
 test-android-diagnostics:

@@ -84,7 +84,7 @@
 #include <stdlib.h>
 
 #ifndef CARDIO_HAS_POSIX_FD
-#if defined(_POSIX_C_SOURCE) || defined(__ANDROID__)
+#if !defined(ESP_PLATFORM) && (defined(_POSIX_C_SOURCE) || defined(__ANDROID__))
 #define CARDIO_HAS_POSIX_FD 1
 #else
 #define CARDIO_HAS_POSIX_FD 0
@@ -159,6 +159,11 @@
 #include <vector>
 
 #include <thread>
+
+#if defined(ESP_PLATFORM)
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
 
 #if CARDIO_WITH_SUPPLEMENTAL
 #include <chrono>
@@ -374,16 +379,26 @@ namespace internal {
     thread& operator=(const thread&) = delete;
   };
 
-  inline thread::id current_thread_id() noexcept {
+  using thread_id = thread::id;
+  inline thread_id current_thread_id() noexcept {
     return ::GetCurrentThreadId();
   }
 #else
   using mutex = std::mutex;
   using condition_variable = std::condition_variable;
   using thread = std::thread;
-  inline thread::id current_thread_id() noexcept {
+#if defined(ESP_PLATFORM)
+  // pthread_self() cannot identify an ordinary FreeRTOS task, including app_main.
+  using thread_id = TaskHandle_t;
+  inline thread_id current_thread_id() noexcept {
+    return xTaskGetCurrentTaskHandle();
+  }
+#else
+  using thread_id = thread::id;
+  inline thread_id current_thread_id() noexcept {
     return std::this_thread::get_id();
   }
+#endif
 #endif
 }  // namespace internal
 
@@ -2791,7 +2806,7 @@ private:
   friend struct internal::cancellation_state;
 
   dispatcher_feature features_ = dispatcher_feature::none;
-  internal::thread::id owner_thread_id_{};
+  internal::thread_id owner_thread_id_{};
   std::unique_ptr<dispatcher_group> owned_group_;
   dispatcher_group* group_ = nullptr;
   std::shared_ptr<internal::dispatcher_lifetime> lifetime_;
@@ -2828,7 +2843,7 @@ private:
   std::size_t active_continuations_ = 0;
 #if CARDIO_HAS_NATIVE_WAIT
   bool wait_polling_ = false;
-  ::cardio::internal::thread::id wait_polling_thread_id_{};
+  ::cardio::internal::thread_id wait_polling_thread_id_{};
 #endif
 #if CARDIO_HAS_EXCEPTIONS
   std::function<void(std::exception_ptr)> unhandled_exception_;
@@ -2889,7 +2904,7 @@ private:
   inline void mark_wait_polling(bool polling) noexcept {
     wait_polling_ = polling;
     wait_polling_thread_id_ =
-        polling ? ::cardio::internal::current_thread_id() : ::cardio::internal::thread::id{};
+        polling ? ::cardio::internal::current_thread_id() : ::cardio::internal::thread_id{};
   }
 
   inline bool should_notify_native_wait_from_current_thread() const noexcept {
@@ -3880,7 +3895,7 @@ public:
    * an unbound dispatcher or a call from another thread.
    */
   inline bool is_current_thread_owner() const noexcept {
-    return owner_thread_id_ != internal::thread::id{} &&
+    return owner_thread_id_ != internal::thread_id{} &&
            owner_thread_id_ == internal::current_thread_id();
   }
 
@@ -4001,7 +4016,7 @@ public:
   inline void park(
       shutdown_mode mode = shutdown_mode::gentle,
       park_policy policy = park_policy::external_pump_first) {
-    if (owner_thread_id_ != internal::thread::id{} &&
+    if (owner_thread_id_ != internal::thread_id{} &&
         !is_current_thread_owner()) {
       internal::fail_runtime_error(
           "cardio: thread-bound dispatcher must be parked on its owner thread");
@@ -4097,7 +4112,7 @@ public:
             condition_.wait_until(lock, *timer_deadline);
           } else {
             condition_.wait(lock, [this, mode] {
-              return !queue_.empty() || group_->should_exit(mode);
+              return !queue_.empty() || !timer_waits_.empty() || group_->should_exit(mode);
             });
           }
 #endif
@@ -4292,7 +4307,7 @@ namespace internal {
     std::vector<looper_registration> wait_registrations_;
     dispatcher::wait_snapshot looper_wait_snapshot_;
     bool looper_wait_snapshot_valid_ = false;
-    ::cardio::internal::thread::id owner_thread_;
+    ::cardio::internal::thread_id owner_thread_;
     shutdown_mode active_shutdown_mode_ = shutdown_mode::gentle;
     bool parked_ = false;
 
