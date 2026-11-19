@@ -25,3 +25,12 @@ for target in test test-win32 test-android; do
     esac
 done
 echo 'Build parallelism: PASS'
+
+dll=build/win32/shared/libcardio.dll
+make -C "$root" -B -n -j4 WIN32_CXX=link-probe "$dll" "$dll.a" > win32-commands
+links=$(awk '$1 == "link-probe" { count++ } END { print count + 0 }' win32-commands)
+if [ "$links" -ne 1 ]; then
+    echo "Expected one link for the DLL and its import library, got $links" >&2
+    exit 1
+fi
+echo 'Win32 shared library build: PASS'
