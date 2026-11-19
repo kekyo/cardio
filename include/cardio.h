@@ -83,8 +83,18 @@
 
 #include <stdlib.h>
 
+#if defined(ESP_PLATFORM)
+#include <sdkconfig.h>
+#endif
+
 #ifndef CARDIO_HAS_POSIX_FD
-#if !defined(ESP_PLATFORM) && (defined(_POSIX_C_SOURCE) || defined(__ANDROID__))
+#if defined(ESP_PLATFORM)
+#if CONFIG_VFS_SUPPORT_SELECT
+#define CARDIO_HAS_POSIX_FD 1
+#else
+#define CARDIO_HAS_POSIX_FD 0
+#endif
+#elif defined(_POSIX_C_SOURCE) || defined(__ANDROID__)
 #define CARDIO_HAS_POSIX_FD 1
 #else
 #define CARDIO_HAS_POSIX_FD 0
@@ -133,6 +143,7 @@
 #define CARDIO_HAS_NATIVE_WAIT 0
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -170,8 +181,17 @@
 #endif
 
 #if CARDIO_HAS_POSIX_FD
+#if defined(ESP_PLATFORM)
+#if !CONFIG_VFS_SUPPORT_SELECT
+#error "ESP-IDF file descriptor waits require CONFIG_VFS_SUPPORT_SELECT"
+#endif
+#include <esp_vfs_eventfd.h>
+#include <sys/poll.h>
+#include <sys/select.h>
+#else
 #include <fcntl.h>
 #include <poll.h>
+#endif
 #include <unistd.h>
 #endif
 
@@ -1445,6 +1465,14 @@ namespace internal {
     return (interests & (fd_event::read | fd_event::write)) != fd_event::none;
   }
 
+  inline bool valid_wait_fd(int fd) noexcept {
+#if defined(ESP_PLATFORM)
+    return fd >= 0 && fd < FD_SETSIZE;
+#else
+    return fd >= 0;
+#endif
+  }
+
   inline short to_poll_events(fd_event interests) noexcept {
     auto events = short{};
     if ((interests & fd_event::read) != fd_event::none) {
@@ -1477,7 +1505,9 @@ namespace internal {
   private:
     std::deque<std::shared_ptr<fd_wait_state>> waits_;
     int wakeup_read_fd_ = -1;
+#if !defined(ESP_PLATFORM)
     int wakeup_write_fd_ = -1;
+#endif
 
     static inline void close_fd(int& fd) noexcept {
       if (fd < 0) {
@@ -1488,6 +1518,7 @@ namespace internal {
       fd = -1;
     }
 
+#if !defined(ESP_PLATFORM)
     static inline void set_fd_flags(int fd) {
       auto flags = ::fcntl(fd, F_GETFL, 0);
       if (flags == -1) {
@@ -1508,7 +1539,14 @@ namespace internal {
       }
     }
 
+#endif
+
     inline void drain_wakeup() noexcept {
+#if defined(ESP_PLATFORM)
+      uint64_t counter;
+      // One eventfd read consumes the accumulated notifications.
+      while (::read(wakeup_read_fd_, &counter, sizeof(counter)) < 0 && errno == EINTR) {}
+#else
       char buffer[64]{};
       while (true) {
         const auto result = ::read(wakeup_read_fd_, buffer, sizeof(buffer));
@@ -1526,6 +1564,7 @@ namespace internal {
         }
         return;
       }
+#endif
     }
 
   public:
@@ -1539,6 +1578,16 @@ namespace internal {
     };
 
     inline posix_fd_wait_backend() {
+#if defined(ESP_PLATFORM)
+      wakeup_read_fd_ = ::eventfd(0, 0);
+      if (wakeup_read_fd_ < 0) {
+        fail_system_error(errno, "cardio: eventfd failed (register the eventfd VFS before creating a dispatcher)");
+      }
+      if (!valid_wait_fd(wakeup_read_fd_)) {
+        close_fd(wakeup_read_fd_);
+        fail_system_error(EMFILE, "cardio: eventfd is outside FD_SETSIZE");
+      }
+#else
       int fds[2]{-1, -1};
       if (::pipe(fds) == -1) {
         fail_system_error(errno, "cardio: pipe failed");
@@ -1565,11 +1614,14 @@ namespace internal {
       fds[0] = -1;
       fds[1] = -1;
 #endif
+#endif
     }
 
     inline ~posix_fd_wait_backend() {
       close_fd(wakeup_read_fd_);
+#if !defined(ESP_PLATFORM)
       close_fd(wakeup_write_fd_);
+#endif
     }
 
     posix_fd_wait_backend(const posix_fd_wait_backend&) = delete;
@@ -1580,10 +1632,16 @@ namespace internal {
     }
 
     inline void notify() noexcept {
+#if defined(ESP_PLATFORM)
+      const auto value = uint64_t{1};
+      const int fd = wakeup_read_fd_;
+#else
       const auto value = char{1};
+      const int fd = wakeup_write_fd_;
+#endif
       while (true) {
-        const auto result = ::write(wakeup_write_fd_, &value, 1);
-        if (result == 1) {
+        const auto result = ::write(fd, &value, sizeof(value));
+        if (result == sizeof(value)) {
           return;
         }
         if (result == -1 && errno == EINTR) {
@@ -1659,22 +1717,42 @@ namespace internal {
       return result;
     }
 
-    static inline void wait(snapshot& snapshot) {
-      if (snapshot.empty()) {
-        return;
+    static inline void wait(std::vector<pollfd>& fds, int timeout_milliseconds) {
+#if defined(ESP_PLATFORM)
+      fd_set readers, writers, errors;
+      FD_ZERO(&readers);
+      FD_ZERO(&writers);
+      FD_ZERO(&errors);
+      int nfds = 0;
+      for (auto& entry : fds) {
+        entry.revents = 0;
+        if (entry.events & POLLIN) FD_SET(entry.fd, &readers);
+        if (entry.events & POLLOUT) FD_SET(entry.fd, &writers);
+        FD_SET(entry.fd, &errors);
+        nfds = std::max(nfds, entry.fd + 1);
       }
-
-      auto poll_result = int{};
+      timeval timeout{timeout_milliseconds / 1000, (timeout_milliseconds % 1000) * 1000};
+      const int ready = ::select(nfds, &readers, &writers, &errors,
+                                 timeout_milliseconds < 0 ? nullptr : &timeout);
+      if (ready < 0 && errno != EINTR) {
+        fail_system_error(errno, "cardio: select failed");
+      }
+      if (ready <= 0) return;  // park() recomputes the deadline after an interrupt.
+      for (auto& entry : fds) {
+        // Several independent waits may request different interests on one fd.
+        if ((entry.events & POLLIN) && FD_ISSET(entry.fd, &readers)) entry.revents |= POLLIN;
+        if ((entry.events & POLLOUT) && FD_ISSET(entry.fd, &writers)) entry.revents |= POLLOUT;
+        if (FD_ISSET(entry.fd, &errors)) entry.revents |= POLLERR;
+      }
+#else
+      int result;
       do {
-        poll_result = ::poll(
-            snapshot.poll_fds.data(),
-            static_cast<nfds_t>(snapshot.poll_fds.size()),
-            -1);
-      } while (poll_result == -1 && errno == EINTR);
-
-      if (poll_result == -1) {
+        result = ::poll(fds.data(), static_cast<nfds_t>(fds.size()), timeout_milliseconds);
+      } while (result == -1 && errno == EINTR);
+      if (result == -1) {
         fail_system_error(errno, "cardio: poll failed");
       }
+#endif
     }
 
     inline std::vector<std::coroutine_handle<>> collect_ready(
@@ -3159,17 +3237,7 @@ private:
     }
 
 #if CARDIO_HAS_POSIX_FD
-    auto poll_result = int{};
-    do {
-      poll_result = ::poll(
-          snapshot.poll_fds.data(),
-          static_cast<nfds_t>(snapshot.poll_fds.size()),
-          timeout_milliseconds);
-    } while (poll_result == -1 && errno == EINTR);
-
-    if (poll_result == -1) {
-      internal::fail_system_error(errno, "cardio: poll failed");
-    }
+    internal::fd_wait_backend::wait(snapshot.poll_fds, timeout_milliseconds);
 
     for (auto index = std::size_t{0};
          index < snapshot.fd_snapshot.poll_fds.size(); ++index) {
@@ -3654,7 +3722,14 @@ private:
       std::coroutine_handle<> continuation) {
     auto notify_native_wait = false;
     {
-      auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
+      auto lock = std::unique_lock<::cardio::internal::mutex>(mutex_);
+#if CARDIO_HAS_EXCEPTIONS
+      if (wait->canceled) {
+        lock.unlock();
+        enqueue(continuation);
+        return;
+      }
+#endif
       fd_waits_.register_wait(this, std::move(wait), continuation);
       notify_native_wait = should_notify_native_wait_from_current_thread();
     }
@@ -3692,6 +3767,11 @@ private:
     auto notify_native_wait = false;
     {
       auto lock = std::lock_guard<::cardio::internal::mutex>(mutex_);
+      // Cancellation can arrive between installing its callback and publishing the wait.
+      if (wait && !wait->continuation) {
+        wait->canceled = true;
+        return;
+      }
       if (wait && wait->owner == this && wait->registered) {
         wait->canceled = true;
         continuation = wait->continuation;
@@ -4144,7 +4224,7 @@ public:
         if (!queue_.empty()) {
 #if CARDIO_HAS_NATIVE_WAIT
           shutdown_wait_probe_done = false;
-          mark_wait_polling(false);
+          // Another park worker can still own the native wait snapshot.
 #endif
           work = std::move(queue_.front());
           queue_.pop_front();
@@ -6579,17 +6659,15 @@ namespace internal {
       }
 #endif
 
-      current.register_fd_wait(state, continuation_handle);
-
 #if CARDIO_HAS_EXCEPTIONS
       (void)cancellation_.try_register_callback(
           [target = &current, wait = state] {
-            wait->cancellation_registration_.reset();
             target->cancel_fd_wait(wait);
           },
           state->cancellation_registration_);
 #endif
-
+      // A different park worker can resume and destroy this awaiter as soon as it is registered.
+      current.register_fd_wait(state, continuation_handle);
       return true;
     }
 
@@ -8480,13 +8558,13 @@ inline promise<T> rejected(Exception exception) {
  * The file descriptor is not owned by the promise and is never closed by it.
  */
 inline promise<fd_event> from_fd(int fd, fd_event interests) {
-  if (fd < 0) {
+  if (!internal::valid_wait_fd(fd)) {
 #if CARDIO_HAS_EXCEPTIONS
     return rejected<fd_event>(std::invalid_argument(
-        "cardio: file descriptor must not be negative"));
+        "cardio: file descriptor is out of range"));
 #else
     internal::fail_invalid_argument(
-        "cardio: file descriptor must not be negative");
+        "cardio: file descriptor is out of range");
 #endif
   }
 
@@ -8521,9 +8599,9 @@ inline promise<fd_event> from_fd(
     int fd,
     fd_event interests,
     cancellation cancellation) {
-  if (fd < 0) {
+  if (!internal::valid_wait_fd(fd)) {
     return rejected<fd_event>(std::invalid_argument(
-        "cardio: file descriptor must not be negative"));
+        "cardio: file descriptor is out of range"));
   }
 
   if (!internal::has_fd_io_interest(interests)) {

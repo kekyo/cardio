@@ -4,6 +4,11 @@
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "unity.h"
+#ifndef CARDIO_TEST_CORE_ONLY
+#include "esp_netif.h"
+#include "esp_vfs_eventfd.h"
+#include "loopback.h"
+#endif
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -101,11 +106,128 @@ static void timer_added_to_idle_dispatcher() {
   vEventGroupDelete(state.events);
 }
 
+#ifndef CARDIO_TEST_CORE_ONLY
+static void earlier_timer_interrupts_select() {
+  workers state;
+  auto later = cardio::promises::delay(60000);
+  TEST_ASSERT_EQUAL(pdPASS, xTaskCreatePinnedToCore(park_worker, "cardio-select", 6144,
+      &state, uxTaskPriorityGet(nullptr) + 1, nullptr, esp_cpu_get_core_id()));
+  auto earlier = stop_after_timer(state.group);
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  TEST_ASSERT_TRUE(earlier.is_ready());
+  TEST_ASSERT_FALSE(later.is_ready());
+  vEventGroupDelete(state.events);
+}
+
+static void tcp_and_eventfd() {
+  workers state;
+  const int fd = eventfd(0, 0);
+  TEST_ASSERT_GREATER_OR_EQUAL(0, fd);
+  auto ready = cardio::from_fd(fd, cardio::fd_event::read);
+  auto exchange = loopback_exchange();
+  for (unsigned i = 0; i < worker_count; ++i) {
+    TEST_ASSERT_EQUAL(pdPASS, xTaskCreatePinnedToCore(park_worker, "cardio-io", 6144,
+        &state, 3, nullptr, i));
+  }
+  const uint64_t signal = 7;
+  TEST_ASSERT_EQUAL(sizeof(signal), write(fd, &signal, sizeof(signal)));
+  // Both waits must finish before the park workers are asked to return.
+  auto finish = [&]() -> cardio::promise<void> {
+    co_await ready;
+    co_await exchange;
+    state.group.shutdown();
+  };
+  auto done = finish();
+  for (unsigned i = 0; i < worker_count; ++i) {
+    ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
+  }
+  TEST_ASSERT_TRUE(done.is_ready());
+  TEST_ASSERT_TRUE(exchange.unsafe_result());
+  TEST_ASSERT_TRUE((ready.unsafe_result() & cardio::fd_event::read) == cardio::fd_event::read);
+  uint64_t value = 0;
+  TEST_ASSERT_EQUAL(sizeof(value), read(fd, &value, sizeof(value)));
+  TEST_ASSERT_EQUAL_UINT(7, value);
+  close(fd);
+  vEventGroupDelete(state.events);
+}
+
+#if CARDIO_HAS_EXCEPTIONS
+static void cancel_and_reuse_fd() {
+  cardio::dispatcher_host dispatcher;
+  int fd = eventfd(0, 0);
+  TEST_ASSERT_GREATER_OR_EQUAL(0, fd);
+  cardio::cancellation_source cancel;
+  auto old = cardio::from_fd(fd, cardio::fd_event::read, cancel.get_cancellation());
+  cancel.cancel();
+  dispatcher.park();
+  try {
+    (void)old.unsafe_result();
+    TEST_FAIL_MESSAGE("Expected cancellation");
+  } catch (const cardio::canceled_exception&) {}
+  TEST_ASSERT_EQUAL(0, close(fd));
+  const int reused = eventfd(0, 0);
+  TEST_ASSERT_EQUAL(fd, reused);
+  auto fresh = cardio::from_fd(reused, cardio::fd_event::read);
+  const uint64_t one = 1;
+  TEST_ASSERT_EQUAL(sizeof(one), write(reused, &one, sizeof(one)));
+  dispatcher.park();
+  TEST_ASSERT_TRUE(fresh.unsafe_result() == cardio::fd_event::read);
+  TEST_ASSERT_EQUAL(0, close(reused));
+  auto out_of_range = cardio::from_fd(FD_SETSIZE, cardio::fd_event::read);
+  try {
+    (void)out_of_range.unsafe_result();
+    TEST_FAIL_MESSAGE("Expected FD_SETSIZE to be rejected");
+  } catch (const std::invalid_argument&) {}
+}
+
+static void cancellation_races_readiness() {
+  workers state;
+  sample_socket event(eventfd(0, 0));
+  cardio::cancellation_source cancel;
+  unsigned completions = 0;
+  auto wait = [&]() -> cardio::promise<void> {
+    try {
+      const auto ready = co_await cardio::from_fd(event.fd, cardio::fd_event::read,
+                                                   cancel.get_cancellation());
+      configASSERT(ready == cardio::fd_event::read);
+    } catch (const cardio::canceled_exception&) {}
+    ++completions;
+    state.group.shutdown();
+  };
+  auto result = wait();
+  for (unsigned i = 0; i < worker_count; ++i) {
+    TEST_ASSERT_EQUAL(pdPASS, xTaskCreatePinnedToCore(park_worker, "cardio-race", 6144,
+        &state, 3, nullptr, i));
+  }
+  const uint64_t one = 1;
+  TEST_ASSERT_EQUAL(sizeof(one), write(event.fd, &one, sizeof(one)));
+  cancel.cancel();
+  for (unsigned i = 0; i < worker_count; ++i) ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
+  TEST_ASSERT_TRUE(result.is_ready());
+  TEST_ASSERT_EQUAL_UINT(1, completions);
+  vEventGroupDelete(state.events);
+}
+#endif
+#endif
+
 extern "C" void app_main() {
+#ifndef CARDIO_TEST_CORE_ONLY
+  ESP_ERROR_CHECK(esp_netif_init());
+  const esp_vfs_eventfd_config_t config{4};
+  ESP_ERROR_CHECK(esp_vfs_eventfd_register(&config));
+#endif
   UNITY_BEGIN();
   RUN_TEST(task_bound_dispatcher);
   RUN_TEST(shared_dispatcher);
   RUN_TEST(timer_added_to_idle_dispatcher);
+#ifndef CARDIO_TEST_CORE_ONLY
+  RUN_TEST(tcp_and_eventfd);
+  RUN_TEST(earlier_timer_interrupts_select);
+#if CARDIO_HAS_EXCEPTIONS
+  RUN_TEST(cancel_and_reuse_fd);
+  RUN_TEST(cancellation_races_readiness);
+#endif
+#endif
   std::printf("app_main stack free: %u bytes\n",
               static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
   for (unsigned core = 0; core < worker_count; ++core) {
