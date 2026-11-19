@@ -2,9 +2,12 @@
 set -eu
 
 : "${PORT:?Set PORT to the exact serial port of the ESP32-S3}"
-case "$PORT" in
-  *'*'*|*'?'*|*'['*) echo "PORT must identify one serial port" >&2; exit 1 ;;
-esac
+console_port=${TEST_PORT:-$PORT}
+for port in "$PORT" "$console_port"; do
+  case "$port" in
+    *'*'*|*'?'*|*'['*) echo "Specify one exact serial port: $port" >&2; exit 1 ;;
+  esac
+done
 # esptool 5 checks the detected chip against --chip before reading the MAC.
 identity=$(esptool --chip esp32s3 --port "$PORT" read-mac)
 printf '%s\n' "$identity"
@@ -21,4 +24,4 @@ if [[ -n ${EXPECT_MAC:-} ]]; then
 fi
 pio test -d samples/espidf -e esp32s3 --without-uploading --without-testing
 exec timeout 180 pio test -d samples/espidf -e esp32s3 --without-building \
-  --upload-port "$PORT" --test-port "${TEST_PORT:-$PORT}"
+  --upload-port "$PORT" --test-port "$console_port"

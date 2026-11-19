@@ -19,9 +19,13 @@ unset PORT EXPECT_MAC TEST_PORT
 export CHIP=esp32s3
 if bash "$script" > /dev/null 2>&1; then exit 1; fi
 export PORT=/dev/test-board
+if PORT='/dev/test-*' bash "$script" > /dev/null 2>&1; then exit 1; fi
+if TEST_PORT='/dev/ttyUSB*' bash "$script" > /dev/null 2>&1; then exit 1; fi
 if CHIP=esp32c3 bash "$script" > /dev/null 2>&1; then exit 1; fi
 if EXPECT_MAC=00:00:00:00:00:00 bash "$script" > /dev/null 2>&1; then exit 1; fi
 test ! -e "$CALLS"
 EXPECT_MAC=12:34:56:AB:CD:EF TEST_PORT=/dev/test-console bash "$script" > /dev/null
 grep -Fqx 'test -d samples/espidf -e esp32s3 --without-building --upload-port /dev/test-board --test-port /dev/test-console' "$CALLS"
+bash "$script" > /dev/null
+grep -Fqx 'test -d samples/espidf -e esp32s3 --without-building --upload-port /dev/test-board --test-port /dev/test-board' "$CALLS"
 echo 'ESP32-S3 hardware selection: PASS'
