@@ -42,6 +42,7 @@ ANDROID_RUNTIME_ABI ?= x86_64
 ANDROID_EXPECTED_API ?=
 ANDROID_EXPECTED_PAGE_SIZE ?=
 ANDROID_DEVICE_TEST_DIR ?= /data/local/tmp/cardio-tests
+ANDROID_DEVICE_MANUAL_TEST_BIN := $(ANDROID_DEVICE_TEST_DIR)/cardio_android_manual_test
 ANDROID_ADB := $(ADB) $(if $(strip $(ADB_SERIAL)),-s $(ADB_SERIAL),)
 
 UNAME_S := $(shell uname -s)
@@ -376,10 +377,11 @@ test-android-runtime: test-android $(ANDROID_RUNTIME_MANUAL_TEST_BIN)
 	if [ "$$actual_api" != "$(ANDROID_EXPECTED_API)" ]; then \
 		echo "Android API mismatch: expected $(ANDROID_EXPECTED_API), got $$actual_api"; exit 1; \
 	fi
-	$(ANDROID_ADB) shell mkdir -p $(ANDROID_DEVICE_TEST_DIR)
-	$(ANDROID_ADB) push $(ANDROID_RUNTIME_MANUAL_TEST_BIN) $(ANDROID_DEVICE_TEST_DIR)/cardio_android_manual_test
-	$(ANDROID_ADB) shell chmod 755 $(ANDROID_DEVICE_TEST_DIR)/cardio_android_manual_test
-	$(ANDROID_ADB) shell timeout -k 5s 60s $(ANDROID_DEVICE_TEST_DIR)/cardio_android_manual_test $(ANDROID_EXPECTED_PAGE_SIZE)
+	$(ANDROID_ADB) push $(ANDROID_RUNTIME_MANUAL_TEST_BIN) $(ANDROID_DEVICE_MANUAL_TEST_BIN)
+# API 24 adbd can lose the exit status if a command finishes before stdin closes.
+# A script on stdin keeps the shell alive until it has read EOF.
+	printf '%s\n' 'chmod 755 "$(ANDROID_DEVICE_MANUAL_TEST_BIN)" &&' \
+		'timeout -k 5s 60s "$(ANDROID_DEVICE_MANUAL_TEST_BIN)" $(ANDROID_EXPECTED_PAGE_SIZE)' | $(ANDROID_ADB) shell -T
 	$(ANDROID_ADB) install -r $(ANDROID_RUNTIME_AUTO_TEST_APK)
 	@output="$$( $(ANDROID_ADB) shell am instrument -w com.example.cardio/.CardioInstrumentation 2>&1 )"; status=$$?; \
 	printf '%s\n' "$$output"; \

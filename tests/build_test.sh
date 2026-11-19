@@ -34,3 +34,59 @@ if [ "$links" -ne 1 ]; then
     exit 1
 fi
 echo 'Win32 shared library build: PASS'
+
+# API 24 adbd can lose the exit status of a short command after it succeeds.
+cat > adb <<'EOF'
+#!/bin/sh
+set -eu
+case "$1" in
+    shell)
+        shift
+        case "$*" in
+            -T) exec sh ;;
+            'getprop ro.product.cpu.abi') echo x86_64 ;;
+            'getprop ro.build.version.sdk') echo 24 ;;
+            'am instrument '*) echo 'cardio_android_auto_test: PASS' ;;
+            *)
+                output=$("$@")
+                [ -n "$output" ] || exit 255
+                printf '%s\n' "$output"
+                ;;
+        esac
+        ;;
+    push)
+        mkdir -p "$(dirname "$3")"
+        cp "$2" "$3"
+        chmod 777 "$3"
+        ;;
+    install) test -f "$3" ;;
+    *) exit 1 ;;
+esac
+EOF
+cat > manual-test <<'EOF'
+#!/bin/sh
+set -eu
+test -n "$(find "$0" -perm 0755)"
+test "$1" = 4096
+echo 'cardio_android_manual_test: PASS'
+EOF
+chmod +x adb manual-test
+touch auto-test.apk
+run_android_runtime() {
+    make -C "$root" -o test-android test-android-runtime \
+        ADB="$work/adb" ADB_SERIAL= ANDROID_RUNTIME_ABI=x86_64 \
+        ANDROID_EXPECTED_API=24 ANDROID_EXPECTED_PAGE_SIZE="$1" \
+        ANDROID_DEVICE_TEST_DIR="$work/device/cardio-tests" \
+        ANDROID_RUNTIME_MANUAL_TEST_BIN="$work/manual-test" \
+        ANDROID_RUNTIME_AUTO_TEST_APK="$work/auto-test.apk" > android-runtime.log 2>&1
+}
+if ! run_android_runtime 4096; then
+    cat android-runtime.log >&2
+    exit 1
+fi
+grep -Fxq 'cardio_android_manual_test: PASS' android-runtime.log
+if run_android_runtime 16384; then
+    echo 'Android runtime ignored a failing manual test' >&2
+    exit 1
+fi
+echo 'Android executable deployment: PASS'
