@@ -1,3 +1,4 @@
 | cases.cpp:40:3:40:7 | call to start | Keep the returned owner alive until the operation or registration is no longer needed. |
 | cases.cpp:41:9:41:13 | call to start | Keep the returned owner alive until the operation or registration is no longer needed. |
 | cases.cpp:42:9:42:33 | call to on_cancellation_requested | Keep the returned owner alive until the operation or registration is no longer needed. |
+| cases.cpp:187:9:187:23 | call to from_fd | Keep the returned owner alive until the operation or registration is no longer needed. |

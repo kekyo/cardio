@@ -172,3 +172,17 @@ cardio::promise<size_type> replaced_operation(std::span<char> caller) {
   pending = cardio::win32::read(1, caller);
   return pending;
 }
+
+namespace cardio {
+template <class T> struct promise_source { promise<T> get_promise(); };
+promise<int> from_fd(int, int);
+promise<int> resolved(int);
+promise<int> rejected(int);
+}
+void pending_or_observing(cardio::promise_source<int>& source, int fd) {
+  (void)source.get_promise();
+  (void)cardio::resolved(42);
+  (void)cardio::rejected(1);
+  (void)cardio::from_fd(-1, 1);
+  (void)cardio::from_fd(fd, 1); // alert: DiscardedAsyncOwner
+}
