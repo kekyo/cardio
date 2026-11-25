@@ -1,0 +1,7 @@
+- description: Additional checks for cardio
+- queries: .
+  from: codeql/cpp-queries
+- include:
+    id:
+      - cpp/overflow-buffer
+      - cpp/invalid-pointer-deref
