@@ -1,0 +1,5 @@
+| cases.cpp:52:16:52:23 | call to shutdown | Hold the mutex of this lifetime token while using its dispatcher. |
+| cases.cpp:59:19:59:26 | call to shutdown | Hold the mutex of this lifetime token while using its dispatcher. |
+| cases.cpp:61:21:61:28 | call to shutdown | Hold the mutex of this lifetime token while using its dispatcher. |
+| cases.cpp:64:31:64:38 | call to shutdown | Hold the mutex of this lifetime token while using its dispatcher. |
+| cases.cpp:133:16:133:23 | call to shutdown | Hold the mutex of this lifetime token while using its dispatcher. |

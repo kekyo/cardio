@@ -5,3 +5,4 @@
     id:
       - cpp/overflow-buffer
       - cpp/invalid-pointer-deref
+- queries: queries
