@@ -128,9 +128,9 @@ cleanup_android_test() {
 
     if [ -n "$android_test_pid" ]; then
         timeout --kill-after=5s 10s "$android_test_adb" -s "$android_test_serial" emu kill >/dev/null 2>&1 || true
-        if kill -0 "$android_test_pid" >/dev/null 2>&1; then
-            kill "$android_test_pid" >/dev/null 2>&1 || true
-        fi
+        # QEMU can ignore SIGTERM after the console shutdown request. The AVD
+        # is temporary and snapshots are disabled, so it is safe to stop it now.
+        kill -KILL "$android_test_pid" >/dev/null 2>&1 || true
         wait "$android_test_pid" >/dev/null 2>&1 || true
     fi
 

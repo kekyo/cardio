@@ -25,13 +25,20 @@ if [ "$*" = '-no-window -version' ]; then
     echo "Android emulator version $DIAGNOSTICS_TEST_EMULATOR_VERSION.0 (test double)"
     exit 0
 fi
-touch "$DIAGNOSTICS_TEST_CASE/started"
+printf '%s\n' "$$" > "$DIAGNOSTICS_TEST_CASE/emulator.pid"
+if [ "$DIAGNOSTICS_TEST_STUCK_PROCESS" = emulator ]; then
+    trap '' TERM
+fi
 echo 'emulator diagnostic output'
 if [ "$DIAGNOSTICS_TEST_CRASH" = kernel ]; then
     echo 'Kernel panic - not syncing: Fatal exception'
 fi
 printf 'ready\n' > "$DIAGNOSTICS_TEST_CASE/ready"
 read -r stop < "$DIAGNOSTICS_TEST_CASE/stop"
+if [ "$DIAGNOSTICS_TEST_STUCK_PROCESS" = emulator ]; then
+    # Acknowledge the console command but keep the guest running.
+    read -r blocked < "$DIAGNOSTICS_TEST_CASE/boot-blocked"
+fi
 EOF
 
 cat > "$diagnostics_test_root/bin/adb" <<'EOF'
@@ -83,12 +90,12 @@ case "$*" in
                         ;;
                 esac
                 if [ "$*" = 'logcat -b all -v threadtime' ]; then
-                    if [ "$DIAGNOSTICS_TEST_LOGCAT_HANG" = 1 ]; then
+                    if [ "$DIAGNOSTICS_TEST_STUCK_PROCESS" = logcat ]; then
                         trap '' TERM
                         echo $$ > "$DIAGNOSTICS_TEST_CASE/logcat.pid"
                     fi
                     printf 'ready\n' > "$DIAGNOSTICS_TEST_CASE/logcat-ready"
-                    if [ "$DIAGNOSTICS_TEST_LOGCAT_HANG" = 1 ]; then
+                    if [ "$DIAGNOSTICS_TEST_STUCK_PROCESS" = logcat ]; then
                         read -r blocked < "$DIAGNOSTICS_TEST_CASE/boot-blocked"
                     fi
                 fi
@@ -127,7 +134,7 @@ export ANDROID_IMAGE_REVISION=5
 export ADB="$diagnostics_test_root/bin/adb"
 export PATH="$diagnostics_test_root/bin:$PATH"
 
-for diagnostics_test_case in failure collection_failure success native java stream restart other kernel stale_emulator stale_image runtime_timeout boot_device boot_query stuck_logcat stuck_logcat_failure; do
+for diagnostics_test_case in failure collection_failure success native java stream restart other kernel stale_emulator stale_image runtime_timeout boot_device boot_query stuck_logcat stuck_logcat_failure stuck_emulator stuck_emulator_failure; do
     export DIAGNOSTICS_TEST_CASE="$diagnostics_test_root/$diagnostics_test_case"
     export ANDROID_TEST_DIAGNOSTICS_DIR="$DIAGNOSTICS_TEST_CASE/saved logs"
     export DIAGNOSTICS_TEST_RESULT=23
@@ -135,7 +142,7 @@ for diagnostics_test_case in failure collection_failure success native java stre
     export DIAGNOSTICS_TEST_CRASH=none
     export DIAGNOSTICS_TEST_EMULATOR_VERSION=37.2.12
     export DIAGNOSTICS_TEST_BOOT=ready
-    export DIAGNOSTICS_TEST_LOGCAT_HANG=0
+    export DIAGNOSTICS_TEST_STUCK_PROCESS=none
     export ANDROID_TEST_BOOT_TIMEOUT_SECONDS=300
     export ANDROID_TEST_RUNTIME_TIMEOUT_SECONDS=600
     printf 'Pkg.Revision=5\n' > "$ANDROID_SDK_ROOT/system-images/android-35/google_apis_ps16k/x86_64/source.properties"
@@ -173,13 +180,13 @@ for diagnostics_test_case in failure collection_failure success native java stre
             export ANDROID_TEST_RUNTIME_TIMEOUT_SECONDS=1
             diagnostics_test_expected_status=124
             ;;
-        stuck_logcat|stuck_logcat_failure)
-            export DIAGNOSTICS_TEST_LOGCAT_HANG=1
-            if [ "$diagnostics_test_case" = stuck_logcat ]; then
-                export DIAGNOSTICS_TEST_RESULT=0
-                diagnostics_test_expected_status=0
-            fi
+        stuck_logcat|stuck_emulator)
+            export DIAGNOSTICS_TEST_STUCK_PROCESS=${diagnostics_test_case#stuck_}
+            export DIAGNOSTICS_TEST_RESULT=0
+            diagnostics_test_expected_status=0
             ;;
+        stuck_logcat_failure) export DIAGNOSTICS_TEST_STUCK_PROCESS=logcat ;;
+        stuck_emulator_failure) export DIAGNOSTICS_TEST_STUCK_PROCESS=emulator ;;
     esac
     mkdir -p "$DIAGNOSTICS_TEST_CASE"
     mkfifo "$DIAGNOSTICS_TEST_CASE/ready" "$DIAGNOSTICS_TEST_CASE/stop" \
@@ -188,25 +195,27 @@ for diagnostics_test_case in failure collection_failure success native java stre
     timeout --kill-after=5s 30s sh "$diagnostics_test_runner" 35 google_apis_ps16k 16384 \
         > "$DIAGNOSTICS_TEST_CASE/output.log" 2>&1 || diagnostics_test_status=$?
 
+    # Stop any leaked test double before reporting a cleanup failure.
+    for diagnostics_test_process in emulator logcat; do
+        diagnostics_test_pid_file="$DIAGNOSTICS_TEST_CASE/$diagnostics_test_process.pid"
+        if [ -f "$diagnostics_test_pid_file" ] && kill -KILL "$(cat "$diagnostics_test_pid_file")" 2>/dev/null; then
+            echo "FAIL: $diagnostics_test_case left $diagnostics_test_process running" >&2
+            exit 1
+        fi
+    done
     if [ "$diagnostics_test_status" -ne "$diagnostics_test_expected_status" ]; then
         cat "$DIAGNOSTICS_TEST_CASE/output.log"
         echo "FAIL: $diagnostics_test_case changed the test exit status" >&2
         exit 1
     fi
     if [ "$diagnostics_test_expected_status" -eq 2 ]; then
-        test ! -f "$DIAGNOSTICS_TEST_CASE/started"
+        test ! -f "$DIAGNOSTICS_TEST_CASE/emulator.pid"
         test ! -f "$DIAGNOSTICS_TEST_CASE/test-completed"
         grep -Fq 'revision mismatch' "$DIAGNOSTICS_TEST_CASE/output.log"
         echo "android_diagnostics_test ($diagnostics_test_case): PASS"
         continue
     fi
     test -f "$DIAGNOSTICS_TEST_CASE/stopped"
-    if [ -f "$DIAGNOSTICS_TEST_CASE/logcat.pid" ]; then
-        if kill -0 "$(cat "$DIAGNOSTICS_TEST_CASE/logcat.pid")" 2>/dev/null; then
-            echo "FAIL: $diagnostics_test_case left the log collector running" >&2
-            exit 1
-        fi
-    fi
     diagnostics_test_saved=("$ANDROID_TEST_DIAGNOSTICS_DIR"/run.*)
     test "${#diagnostics_test_saved[@]}" -eq 1
     diagnostics_test_dir=${diagnostics_test_saved[0]}
