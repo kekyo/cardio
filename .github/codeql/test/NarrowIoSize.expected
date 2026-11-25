@@ -1,0 +1,5 @@
+| cases.cpp:96:3:96:10 | call to ReadFile | Check the buffer length before passing it to this narrower native I/O parameter. |
+| cases.cpp:97:3:97:21 | call to io_uring_prep_write | Check the buffer length before passing it to this narrower native I/O parameter. |
+| cases.cpp:104:5:104:23 | call to io_uring_prep_write | Check the buffer length before passing it to this narrower native I/O parameter. |
+| cases.cpp:146:3:146:10 | call to ReadFile | Check the buffer length before passing it to this narrower native I/O parameter. |
+| cases.cpp:161:3:161:10 | call to ReadFile | Check the buffer length before passing it to this narrower native I/O parameter. |

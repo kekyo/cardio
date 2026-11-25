@@ -1,0 +1,2 @@
+| cases.cpp:71:10:71:28 | call to read | Keep the buffer alive until this I/O operation has completed. |
+| cases.cpp:76:18:76:41 | call to write | Keep the buffer alive until this I/O operation has completed. |
