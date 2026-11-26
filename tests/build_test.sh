@@ -13,14 +13,15 @@ mkdir -p "$ndk_bin"
 ln -s /bin/true "$ndk_bin/x86_64-linux-android24-clang++"
 
 cat > Makefile <<'EOF'
-test test-win32 test-android macos-cross:
+test test-win32 test-android macos-cross test-macos:
 	@echo '$(filter -j%,$(MAKEFLAGS))' > $@
 EOF
 "$root/build.sh"
-targets='test test-win32 test-android'
-if [ "$(uname -sm)" = "Linux x86_64" ]; then
-    targets="$targets macos-cross"
-fi
+case "$(uname -sm)" in
+    Darwin\ *) targets='test-macos' ;;
+    Linux\ x86_64) targets='test test-win32 test-android macos-cross' ;;
+    *) targets='test test-win32 test-android' ;;
+esac
 for target in $targets; do
     jobs=$(cat "$target")
     case "$jobs" in
@@ -29,6 +30,20 @@ for target in $targets; do
     esac
 done
 echo 'Build parallelism: PASS'
+
+mkdir mac-entry
+cat > mac-entry/uname <<'EOF'
+#!/bin/sh
+echo 'Darwin arm64'
+EOF
+chmod +x mac-entry/uname
+ln -s "$(command -v make)" mac-entry/gmake
+cat > mac-entry/Makefile <<'EOF'
+test-macos:
+	@touch native-tests-ran
+EOF
+(cd mac-entry && PATH="$work/mac-entry:$PATH" "$root/build.sh" && test -f native-tests-ran)
+echo 'Native macOS build entry point: PASS'
 
 dll=build/win32/shared/libcardio.dll
 make -C "$root" -B -n -j4 WIN32_CXX=link-probe "$dll" "$dll.a" > win32-commands
