@@ -21,3 +21,16 @@ $(MACOS_ARM64_BINS): $(MACOS_CROSS_DIR)/arm64/%: tests/%.cpp
 $(MACOS_INTEL_BINS) $(MACOS_ARM64_BINS): include/cardio.h tests/test_helpers.h tests/macos/Makefile | $(ZIG)
 	@mkdir -p "$(@D)"
 	$(ZIG) c++ -target $(ZIG_TARGET) -O2 $(CXXFLAGS) $(filter %.cpp,$^) -o "$@"
+
+MACOS_NATIVE_TESTS := $(filter-out $(BUILD_DIR)/cardio_win32_% $(BUILD_DIR)/cardio_fd_test,$(TEST_BINS)) \
+	$(NO_EXCEPTIONS_TEST_BIN) $(NO_POSIX_TEST_BIN) $(SUPPLEMENTAL_DISABLED_TEST_BIN) \
+	$(PRIMITIVES_DISABLED_TEST_BIN) $(BUILD_DIR)/cardio_apple_config_test
+
+$(BUILD_DIR)/cardio_apple_config_test: tests/macos/cardio_apple_config_test.cpp include/cardio.h tests/test_helpers.h | $(BUILD_DIR)
+	$(CXX) $(CXXOPT) $(CXXFLAGS) $< -o "$@" $(LDLIBS)
+
+.PHONY: test-macos
+test-macos: $(MACOS_NATIVE_TESTS) $(BUILD_DIR)/cardio_fd_test
+	@set -e; for binary in $(MACOS_NATIVE_TESTS); do "$$binary"; done
+	@set -e; output=$$("$(BUILD_DIR)/cardio_fd_test"); printf '%s\n' "$$output"; \
+		printf '%s\n' "$$output" | grep -Fxq 'cardio_fd_test: PASS'
