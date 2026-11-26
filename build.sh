@@ -4,6 +4,10 @@ set -e
 
 # Each concurrent C++ compilation also starts a CodeQL extractor in CI.
 build_jobs=4
+case "$(uname -sm)" in
+    Darwin\ *) exec gmake -j"$build_jobs" test-macos ;;
+    Linux\ x86_64) make -j"$build_jobs" macos-cross ;;
+esac
 make -j"$build_jobs" test
 make -j"$build_jobs" test-win32
 
