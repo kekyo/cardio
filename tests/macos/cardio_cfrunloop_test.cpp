@@ -10,6 +10,7 @@
 #error The Core Foundation dispatcher hosts must be available in this build.
 #else
 #include <CoreFoundation/CFRunLoop.h>
+#include <CoreFoundation/CFString.h>
 #include <future>
 #include <thread>
 #include <unistd.h>
@@ -80,7 +81,10 @@ static void run_loop_test() {
   if constexpr (std::is_same_v<Host, cardio::dispatcher_host_cfrunloop>) {
     host.park();
   } else {
-    while (!work.is_ready()) CFRunLoopRunInMode(kCFRunLoopDefaultMode, 30, true);
+    // Frameworks switch modes during input tracking and modal sessions.
+    const auto app_mode = CFSTR("cardio.test.application-mode");
+    CFRunLoopAddCommonMode(loop, app_mode);
+    while (!work.is_ready()) CFRunLoopRunInMode(app_mode, 30, true);
   }
   producer.join();
   CHECK(work.is_ready());
@@ -93,22 +97,35 @@ static void run_loop_test() {
   CHECK_EQ(::close(fds[1]), 0);
 }
 
+static cardio::promise<void> record_read(int fd, int& deliveries, cardio::cancellation cancellation) {
+  try {
+    (void)co_await cardio::from_fd(fd, cardio::fd_event::read, cancellation);
+  } catch (const cardio::canceled_exception&) {
+    ++deliveries;
+    throw;
+  }
+  ++deliveries;
+}
+
 static void cancellation_and_teardown_leave_the_fd_open() {
   int fds[2];
   CHECK_EQ(::pipe(fds), 0);
+  int deliveries = 0;
   {
     cardio::dispatcher_host_cfrunloop_auto host;
     cardio::cancellation_source source;
-    auto wait = cardio::from_fd(fds[0], cardio::fd_event::read, source.get_cancellation());
+    auto wait = record_read(fds[0], deliveries, source.get_cancellation());
     CHECK(source.cancel());
     while (!wait.is_ready()) CFRunLoopRunInMode(kCFRunLoopDefaultMode, 30, true);
     bool canceled = false;
     try { (void)wait.unsafe_result(); } catch (const cardio::canceled_exception&) { canceled = true; }
     CHECK(canceled);
-    auto abandoned = cardio::from_fd(fds[0], cardio::fd_event::read);
+    CHECK_EQ(deliveries, 1);
+    auto abandoned = record_read(fds[0], deliveries, {});
     CHECK_EQ(::write(fds[1], "a", 1), 1);
   }
   (void)CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, false);
+  CHECK_EQ(deliveries, 1);
   char byte = 0;
   CHECK_EQ(::read(fds[0], &byte, 1), 1);
   CHECK_EQ(byte, 'a');
