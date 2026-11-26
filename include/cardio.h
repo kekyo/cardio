@@ -98,7 +98,7 @@
 #else
 #define CARDIO_HAS_POSIX_FD 0
 #endif
-#elif defined(_POSIX_C_SOURCE) || defined(__ANDROID__)
+#elif defined(_POSIX_C_SOURCE) || defined(__ANDROID__) || defined(__APPLE__)
 #define CARDIO_HAS_POSIX_FD 1
 #else
 #define CARDIO_HAS_POSIX_FD 0
