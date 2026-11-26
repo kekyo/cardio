@@ -135,3 +135,31 @@ which allows us to avoid the issue where function pointer optimization was suppr
 ## License
 
 Under MIT.
+
+---
+
+## History
+
+- 1.5.0
+  - Added experimental macOS and iOS support, including file descriptor waits with `poll()` and `kqueue`.
+    Core Foundation dispatchers can run continuations on AppKit and UIKit event loops.
+- 1.4.0
+  - Added ESP-IDF 6.0 support. FreeRTOS tasks can share a dispatcher across cores and await
+    socket readiness, `eventfd` notifications, and ESP events.
+  - Fixed a race between timer expiration and cancellation on shared dispatchers.
+  - Split the English and Japanese documentation into guides by topic and platform.
+- 1.3.0
+  - Fixed a race in the Windows I/O completion port (IOCP) test for canceling queued operations.
+- 1.2.0
+  - Added support for canceling overlapped I/O on Windows XP. A manual Win32 dispatcher can now be bound to its creating thread.
+  - Moved IOCP submission and cancellation onto the port's pump thread and made the limit on queued and in-flight operations configurable.
+- 1.1.0
+  - Added Android support (API level 24 and later), with a manual dispatcher for native Looper threads and an automatic dispatcher for Java UI threads.
+- 1.0.0
+  - Fixed a busy loop in the GLib dispatcher while waiting for a file descriptor to become ready.
+  - Fixed lifetime issues when a `promises::start_new()` worker or a timeout cancellation source outlived its dispatcher.
+- 0.2.0
+  - Added `promises::start_new()` to run a callable on a new worker thread and await its result on the caller's dispatcher.
+- 0.1.0
+  - Initial release of the header-only C++20 library with coroutine promises, cancellation, and asynchronous synchronization primitives.
+  - Included POSIX file descriptor waits, Linux `io_uring` support, GLib/GIO integration, and Win32 asynchronous I/O.
