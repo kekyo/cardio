@@ -5,7 +5,9 @@
 日常のビルドには Linux を使い、Apple のコンパイラと OS を使った実行テストには GitHub Actions を使う。
 成果物はリポジトリ内で再現できるテストとその実行結果とし、バイナリの配布方法は将来配布が必要になった時点で検討する。
 
-macOS のリリース条件は後述の段階1と2で満たす。iOS 向けのビルド確認は追加作業が小さければ同じリリースに含める。macOS の AppKit と iOS の UIKit が動かす GUI のイベントループとの統合は、その後に扱う。
+最初に `poll()` 版を Linux でクロスビルドし、作業ブランチを push して GitHub Actions の Intel と Apple Silicon の両方で動作を確認する。両方のテストが通ったら、`kqueue` を使う手動ホストと、Core Foundation のイベントループ（`CFRunLoop`）に接続するホストを順に実装する。アプリが待機ループを所有するときは `park()` を呼び、AppKit などが既にループを動かしているときは、そのループで継続を自動実行できるようにする。
+
+macOS の experimental 対応は段階1〜5で完了する。iOS 向けのビルド確認は追加作業が小さければ同じリリースに含める。
 
 ## 現行実装と調査結果
 
@@ -25,9 +27,9 @@ macOS 10.13・11.0 上での実行、Apple 付属の libc++ との組み合わ�
 
 | 方式 | 適する用途と実装上の判断 |
 | --- | --- |
-| 既存の `poll()` とパイプ | CLI・サービス・ワーカースレッド向けの初期案。Apple 向けの fd 判定を整えれば、タイマー、キャンセル、複数スレッドからの `park()` を再利用できる。変更が最も小さく、Linux 上で同じ実装をテストできる。[Apple の poll(2)](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/poll.2.html) |
-| `kqueue` / `kevent` | 多数の fd を監視するサービス向け。読み書きの監視をカーネルに登録したままにし、`EVFILT_USER` で別スレッドから起床させる。同じ fd を待つ複数の promise に通知を届け、EOF やエラーを既存の `fd_event` に変換する必要がある。fd 数を増やした計測で `poll()` の配列を組み直す費用が問題になった時点で採用を判断する。[Apple の kqueue(2)](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/kqueue.2.html)・[XNU のイベント定義](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/event.h) |
-| Core Foundation の `CFRunLoop` | macOS の AppKit と iOS の UIKit が所有するイベントループに接続する第一候補。Android の自動ホストと同様に、アプリのメインスレッドで `park()` を呼ばずに使える。別スレッドからの `post()` には `CFRunLoopSourceSignal` と `CFRunLoopWakeUp`、期限には `CFRunLoopTimer`、fd には `CFFileDescriptor` を使う。fd の通知は一度限りで、監視解除時に呼び出し元の fd を閉じない設定を選べる。ユーザー入力の追跡中にも配送するなら、ソースとタイマーを共通の実行モード（common modes）に登録する。[Android の自動ホスト](../android-looper.md)・[Apple の Run Loops](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Multithreading/RunLoopManagement/RunLoopManagement.html)・[CFFileDescriptor](https://developer.apple.com/documentation/corefoundation/cffiledescriptor) |
+| 既存の `poll()` とパイプ | 最初に対応する方式。標準の `dispatcher_host` で CLI・サービス・ワーカースレッドから使う。Apple 向けの fd 判定を整えれば、タイマー、キャンセル、複数スレッドからの `park()` を再利用できる。Linux 上でも同じ実装をテストできる。[Apple の poll(2)](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/poll.2.html) |
+| `kqueue` / `kevent` | `poll()` 版を macOS で実行確認した後に追加する。CLI やワーカースレッドが `park()` を呼ぶと、カーネルに登録した fd の読み書きと次のタイマー期限を待つ。別スレッドからは `EVFILT_USER` で起床させる。同じ fd を待つ複数の promise に通知を届け、EOF やエラーを既存の `fd_event` に変換する。[Apple の kqueue(2)](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/kqueue.2.html)・[XNU のイベント定義](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/event.h) |
+| Core Foundation の `CFRunLoop` | `kqueue` 版に続いて実装する。アプリがループを所有する場合は手動で、AppKit や UIKit が所有する場合は自動で、cardio の継続とアプリのイベントを同じスレッドで処理する。別スレッドからの `post()` には `CFRunLoopSourceSignal` と `CFRunLoopWakeUp`、期限には `CFRunLoopTimer` を使う。`CFFileDescriptor` で `kqueue` 自体の読み出し通知を受けると、個々の fd の監視を手動版と共用できる。ソースとタイマーは共通の実行モード（common modes）に登録する。[Apple の Run Loops](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Multithreading/RunLoopManagement/RunLoopManagement.html)・[CFFileDescriptor と kqueue](https://developer.apple.com/documentation/corefoundation/cffiledescriptor) |
 | Grand Central Dispatch（GCD） | メインキューや既存の dispatch queue に継続を返したいアプリ向け。dispatch source で fd とタイマーを監視できる。通常の直列キューは処理ごとに実行スレッドが変わり得るので、コールバックの間だけ cardio のスレッドローカルな dispatcher を設定し、終了時に復元する。source のキャンセルは非同期のため、解除が完了するまで fd が再利用されないようにする設計も必要になる。[Apple の Dispatch Queues](https://developer.apple.com/documentation/dispatch/dispatchqueue)・[Dispatch Sources](https://developer.apple.com/library/archive/documentation/General/Conceptual/ConcurrencyProgrammingGuide/GCDWorkQueues/GCDWorkQueues.html) |
 
 ## macOS の最低ターゲット
@@ -50,7 +52,9 @@ Linux 上の MinGW が Windows 用の実行ファイルを作るのと同じよ�
 `poll()` の宣言と、macOS のシステムライブラリ `libSystem` がその関数を提供することを示すリンク用定義が同梱されており、今回のテストは Apple SDK を導入せずにリンクできた。
 このクロスビルドでは Zig 側の libc++ を使う。OS 付属の libc++ との互換性や実行時の fd 通知は、Apple Clang でビルドしたテストを macOS 上で実行して確認する。[Zig の C++ コンパイラ](https://ziglang.org/download/0.11.0/release-notes.html#zig-c)・[同梱の poll.h](https://github.com/ziglang/zig/blob/0.15.2/lib/libc/include/any-macos-any/sys/poll.h)・[libSystem のリンク用定義](https://github.com/ziglang/zig/blob/0.15.2/lib/libc/darwin/libSystem.tbd)
 
-調査時のビルドはリポジトリのルートから次のコマンドで再現できる。`-DCARDIO_HAS_POSIX_FD=1` は当時の既定値を補うための指定で、段階1の完了確認ではこの指定を外す。
+日常のビルドでは `build.sh` から macOS 向けの Make ターゲット（案は `make macos-cross`）を呼ぶ。このターゲットが Zig を取得・配置するので、開発者は Zig を事前にインストールしたり `PATH` を設定したりせずに済む。macOS 向けだけを確認するときはこのターゲットを直接使う。
+
+次のコマンドは調査時に実行したコンパイルとリンクを示す。`-DCARDIO_HAS_POSIX_FD=1` は当時の既定値を補うための指定であり、段階2の完了確認では外す。
 
 ```sh
 zig c++ -target x86_64-macos.10.13 -std=c++20 -O2 -pthread \
@@ -65,26 +69,71 @@ OSXCross も Linux から Mach-O を生成できるが、macOS SDK が必要に�
 
 ## 実装の段階と完了条件
 
-### 1. 標準 dispatcher で POSIX fd を待機する
+### 1. Linux のビルドで Zig を自動取得し、macOS 用の実行ファイルを作る
+
+調査で使った Zig 0.15.2 を固定する。Linux x86_64 用の公式アーカイブの URL と SHA-256 をビルド設定に記録し、初回のビルドでダウンロードして照合する。Ubuntu では取得に `curl` と `ca-certificates`、照合に `sha256sum`（`coreutils`）、展開に `tar` と `xz-utils` を使う。一時ディレクトリで検証と展開を終えてから `build/tools/zig/` のバージョン・ホスト別ディレクトリに配置する。2つの CPU 向けターゲットから同じ Zig を Make の依存先として参照する。[Zig の公式配布一覧と SHA-256](https://ziglang.org/download/index.json)・[build.sh](../../../build.sh)・[Makefile](../../../Makefile)
+
+完了条件は、Zig が `PATH` になく配置先も空の Linux 環境で通常のビルドを起動すると、既存の fd テストを Intel・arm64 両方の Mach-O にリンクできることとする。この段階では調査時の fd 有効化指定を使える。並列ビルドで取得は1回に収まり、2回目はネットワークを切っても配置済みの Zig で両方を再ビルドできることを確かめる。ダウンロードの中断やハッシュ不一致の後は、次のビルドで取得し直せることも確認する。
+
+### 2. 標準 dispatcher の `poll()` 版を実装し、ローカルでビルドを確認する
 
 Apple 向けの既定構成で `from_fd()` を使えることを確かめるテストを先に追加する。現行ヘッダーでそのテストが失敗することを確認してから、macOS・iOS で POSIX fd を既定で有効にする。利用者が明示的に `CARDIO_HAS_POSIX_FD=0` を指定する構成もテストする。[Android の既定構成テスト](../../../tests/android/cardio_android_config_test.cpp)・[POSIX fd を無効にする既存テスト](../../../tests/cardio_no_posix_test.cpp)
 
-この段階は、Linux 上で共通テストが通り、追加のマクロ指定なしで既存の fd テスト本体を Intel 10.13 と arm64 11.0 の両方にクロスリンクできれば完了とする。
+完了条件は、Linux の既存テストが通り、Zig のターゲットから fd の強制指定を外しても、Apple の既定構成テストと既存の fd テスト本体を両方の CPU 向けにクロスリンクできることとする。Mach-O に記録された最低 OS が Intel では 10.13、arm64 では 11.0 であることも確かめる。
 
-### 2. macOS で共通テストを実行する
+### 3. `poll()` 版を push し、GitHub Actions の macOS で動作を確認する
 
-macOS 用の Make ターゲットを設ける。現行の `build.sh` は Win32 テストも起動し、`make test` は Android の診断テストにも依存する。共通の C++ テストと各構成のテストを新しいターゲットから実行できるようにする。既存の Makefile を共用する場合は、複数の生成物をまとめて扱う `&:` 規則に対応した GNU Make 4.3 以降を使う。[build.sh](../../../build.sh)・[Makefile](../../../Makefile)・[GNU Make 4.3](https://lists.gnu.org/archive/html/info-gnu/2020-01/msg00004.html)
+macOS 上でビルドして実行する Make ターゲット（案は `make test-macos`）を設ける。現行の `build.sh` は Win32 テストも起動し、`make test` は Android の診断テストにも依存する。共通の C++ テストと macOS に適用できる各構成のテストを新しいターゲットから実行する。既存の Makefile を共用する場合は、複数の生成物をまとめて扱う `&:` 規則に対応した GNU Make 4.3 以降を使う。[build.sh](../../../build.sh)・[Makefile](../../../Makefile)・[GNU Make 4.3](https://lists.gnu.org/archive/html/info-gnu/2020-01/msg00004.html)
 
 GitHub Actions では Intel 用の `macos-15-intel` と arm64 用の `macos-15` で Xcode 16.4 を選ぶ。それぞれの最低 OS を指定して Apple Clang でビルドし、同じランナーで実行する。[GitHub のランナー一覧](https://github.com/actions/runner-images#available-images)・[Intel イメージの Xcode](https://github.com/actions/runner-images/blob/main/images/macos/macos-15-Readme.md)・[arm64 イメージの Xcode](https://github.com/actions/runner-images/blob/main/images/macos/macos-15-arm64-Readme.md)
 
-両ランナーで対象テスト一式が通り、既定構成で `cardio_fd_test: PASS` が出ることを experimental リリースの完了条件とする。パイプの切断、閉じた fd、読み書きの同時通知、別スレッドからの起床、キャンセル、shutdown の挙動を含める。結果にはアーキテクチャ、最低ターゲット、実行した macOS のバージョンを残す。[fd テストの検証項目](../../../tests/cardio_fd_test.cpp#L546)
+段階2のローカル確認後に、`poll()` 版と macOS 用 CI を含む作業ブランチ `feature/macos-support` を `origin` に push する。対象コミットの Actions が完了するまで確認する。両ランナーで対象テスト一式が通り、既定構成で `cardio_fd_test: PASS` が出ることが段階4の着手条件となる。fd テストが `SKIP` で正常終了しても CI は失敗とする。失敗時は修正を push し、新しいコミットで両方の結果を確認する。[現在の push ワークフロー](../../../.github/workflows/ci.yml)・[fd テストの結果表示](../../../tests/cardio_fd_test.cpp#L546)
+
+実行テストにはパイプの切断、閉じた fd、読み書きの同時通知、別スレッドからの起床、キャンセル、shutdown を含める。結果にはコミット、Actions の実行 URL、アーキテクチャ、最低ターゲット、実行した macOS のバージョンを残す。
 
 任意機能の共有ランタイムまで対象に含める場合は、Linux 用の `.so` と `$ORIGIN` を使っているビルド設定を見直し、検証用の `.dylib` と `@loader_path` で既存のプラグインテストを動かす。現行の `test-shared` は Darwin では空で、共有ライブラリのサンプルは Linux の io_uring を既定で有効にしている。[共有ランタイムの Makefile](../../../samples/libcardio/Makefile.posix)・[プラグインをロードするテスト](../../../tests/cardio_shared_host_test.cpp)
 
-### 3. iOS 向けに標準 dispatcher をビルドする（同時対応の候補）
+### 4. `kqueue` / `kevent` で手動の `park()` を実装する
 
-iOS 15 を最低ターゲットの候補とする。Xcode の実機用 SDK（`iphoneos`）と Simulator 用 SDK（`iphonesimulator`）で、`dispatcher_host` と `from_fd()` を使う小さな C++ プログラムをビルドする。両方でコンパイル・リンクできればこの段階は完了とし、結果には使用した SDK と「ビルド確認」を記録する。[Xcode と iOS の対応表](https://developer.apple.com/xcode/system-requirements)
+標準の `poll()` 版に加えて、`dispatcher_host_kqueue`（仮称）を公開する。読み書きは `EVFILT_READ` と `EVFILT_WRITE` に登録し、`park()` は次のタイマー期限まで `kevent()` で待機する。別スレッドからの投稿や待機の取り消しで起床できるようにする。標準版と同じ fd・タイマー・キャンセルの振る舞いをテストで先に表し、同じ fd を待つ複数の処理への通知と、解除後も呼び出し元の fd が使えることを確認する。[POSIX fd の仕様](../posix-fd.md)・[Apple の kqueue(2)](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/kqueue.2.html)
 
-### 4. GUI のメインスレッドで継続を再開する（将来）
+完了条件は、CLI テストがこのホストを選んで `park()` を呼び、fd の読み書き、タイマー、別スレッドからの投稿を処理し、shutdown で待機から戻ることとする。Linux から両 CPU 向けにクロスビルドした後に push し、macOS の両ランナーで標準版と `kqueue` 版のテストが通ることを確認する。[Zig に同梱される sys/event.h](https://github.com/ziglang/zig/blob/0.15.2/lib/libc/include/any-macos-any/sys/event.h)
 
-AppKit・UIKit 用に、前述の `CFRunLoop` に接続する自動ホストを追加する。macOS のアプリと iOS Simulator 上の UIKit アプリで、イベントループを動かしたまま別スレッドから `post()` する。投稿したコールバック、タイマーの継続、fd の継続がメインスレッドで実行され、監視を解除しても呼び出し元の fd が使えることを完了条件とする。[Apple の Run Loops](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Multithreading/RunLoopManagement/RunLoopManagement.html)・[Simulator でのテスト](https://developer.apple.com/library/archive/technotes/tn2339/_index.html)
+### 5. `CFRunLoop` で手動と自動の配送を選べるようにする
+
+アプリがループを所有する場合は `dispatcher_host_cfrunloop` の `park()` で cardio の継続とアプリのイベントを処理する。AppKit などが既にループを動かしている場合は、所有スレッドで `dispatcher_host_cfrunloop_auto` を構築し、アプリから `park()` を呼ばずに継続を実行する。いずれも仮称で、同じ fd 監視、タイマー、起床用ソースを使う。この使い分けは Win32 と Android の手動ホストと自動ホストに合わせる。[Win32 のメッセージ配送](../win32.md)・[Android の Looper](../android-looper.md)
+
+fd 通知のコールバックでは `kevent()` の待ち時間をゼロにして到着済みのイベントを取り出し、次の通知を受けるために `CFFileDescriptor` を再度有効にする。ループの所有スレッドでホストを破棄するときはソースとタイマーを解除し、呼び出し元が所有する fd を引き続き使えるようにする。Core Foundation を使うアプリはビルド時に有効化し（案は `CARDIO_WITH_CFRUNLOOP=1`）、Apple SDK のヘッダーと `-framework CoreFoundation` を使ってビルドする。[CFFileDescriptor のコールバック](https://developer.apple.com/documentation/corefoundation/cffiledescriptor)・[Apple の Run Loops](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Multithreading/RunLoopManagement/RunLoopManagement.html)
+
+公開ヘッダーは、各ホストが使える構成でだけ次のマクロを定義する。開発者は `#include "cardio.h"` の後で `#ifdef` を使ってホストを選べる。マクロ名の案は `kqueue` 手動版が `CARDIO_DISPATCHER_HOST_KQUEUE`、Core Foundation の手動・自動の組が `CARDIO_DISPATCHER_HOST_CFRUNLOOP`。使えない構成ではそれぞれ未定義にする。既存の `CARDIO_HAS_POSIX_FD` は 0 または 1 で fd 待機の有無を表すため、引き続き `#if` で判定する。
+
+```cpp
+#include "cardio.h"
+
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+using worker_host = cardio::dispatcher_host_kqueue;
+#else
+using worker_host = cardio::dispatcher_host;
+#endif
+
+#ifdef CARDIO_DISPATCHER_HOST_CFRUNLOOP
+using native_loop_host = cardio::dispatcher_host_cfrunloop;
+using ui_host = cardio::dispatcher_host_cfrunloop_auto;
+#elif defined(__ANDROID__)
+using native_loop_host = cardio::dispatcher_host_android;
+using ui_host = cardio::dispatcher_host_android_auto;
+#elif CARDIO_HAS_WIN32_HANDLE
+using native_loop_host = cardio::dispatcher_host_win32;
+using ui_host = cardio::dispatcher_host_win32_auto;
+#endif
+```
+
+macOS の両ランナーで手動・自動のテストを実行する。別スレッドからの投稿、タイマー、fd の継続がループの所有スレッドで実行されることを確かめる。手動版では `park()` 中にアプリ独自のイベントも処理し、自動版では既存のループを動かすだけで両方を処理できることを確認する。待機を取り消した後の二重通知や、ホストを破棄した後のコールバックも検出する。
+
+公開例は Core Foundation 有効・無効の macOS、Linux、Win32、Android 向けにビルドする。Linux の既存テスト一式が通ったら作業ブランチを push し、そのコミットに対する Actions の対象テスト一式が通れば macOS 対応を完了とする。
+
+### 6. iOS 向けにビルドする（同時対応の候補）
+
+iOS 15 を最低ターゲットの候補とする。Xcode の実機用 SDK（`iphoneos`）と Simulator 用 SDK（`iphonesimulator`）で、標準ホストと `from_fd()` を使う小さな C++ プログラムをビルドする。両 SDK でコンパイル・リンクできれば iOS のビルド確認は完了とし、結果には使用した SDK を記録する。[Xcode と iOS の対応表](https://developer.apple.com/xcode/system-requirements)
+
+iOS でも追加ホストを有効にする場合は、同じ公開マクロで選んだホストを両 SDK でリンクする。UIKit との動作確認は Simulator 上で行う。メインループを動かしたまま別スレッドから投稿し、投稿したコールバック、タイマー、fd の継続がメインスレッドで実行され、監視解除後も fd が使えることを確かめる。ビルドのみ確認した構成と Simulator で実行した構成は、対応表にそれぞれ記録する。[Simulator でのテスト](https://developer.apple.com/library/archive/technotes/tn2339/_index.html)
