@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 #endif
 
 //-----------------------------------------------------------------------------------------------
@@ -133,6 +134,49 @@ static void write_readiness_resolves_for_writable_pipe() {
 
   close_fd(fds[0]);
   close_fd(fds[1]);
+}
+
+static void canceling_one_wait_preserves_other_waits_on_the_same_fd() {
+  test_dispatcher_host dispatcher;
+  int fds[2];
+  make_pipe(fds);
+  cardio::cancellation_source source;
+  auto canceled = cardio::from_fd(fds[0], cardio::fd_event::read, source.get_cancellation());
+  bool caught = false;
+  auto observer = await_canceled_fd_async(canceled, caught);
+  auto first = cardio::from_fd(fds[0], cardio::fd_event::read);
+  auto second = cardio::from_fd(fds[0], cardio::fd_event::read);
+  CHECK(source.cancel());
+  write_byte(fds[1]);
+  dispatcher.park();
+  CHECK(observer.is_ready() && caught);
+  CHECK(has_event(first.unsafe_result(), cardio::fd_event::read));
+  CHECK(has_event(second.unsafe_result(), cardio::fd_event::read));
+  char byte = 0;
+  CHECK_EQ(::read(fds[0], &byte, 1), 1);
+  CHECK_EQ(byte, 'x');
+  close_fd(fds[0]);
+  close_fd(fds[1]);
+}
+
+static void simultaneous_socket_waits_report_both_ready_directions() {
+  test_dispatcher_host dispatcher;
+  int sockets[40][2];
+  std::vector<cardio::promise<cardio::fd_event>> waits;
+  for (auto& pair : sockets) {
+    make_socket_pair(pair);
+    write_byte(pair[1]);
+    waits.push_back(cardio::from_fd(pair[0], cardio::fd_event::read | cardio::fd_event::write));
+  }
+  dispatcher.park();
+  for (const auto& wait : waits) {
+    CHECK(has_event(wait.unsafe_result(), cardio::fd_event::read));
+    CHECK(has_event(wait.unsafe_result(), cardio::fd_event::write));
+  }
+  for (auto& pair : sockets) {
+    close_fd(pair[0]);
+    close_fd(pair[1]);
+  }
 }
 
 //-----------------------------------------------------------------------------------------------
@@ -548,6 +592,8 @@ int main() {
   read_readiness_resolves_after_write();
   write_readiness_resolves_for_writable_pipe();
   combined_interests_return_combined_events();
+  canceling_one_wait_preserves_other_waits_on_the_same_fd();
+  simultaneous_socket_waits_report_both_ready_directions();
   hangup_readiness_reports_hangup();
   closed_fd_readiness_reports_error();
   invalid_arguments_create_rejected_promises();
@@ -563,7 +609,11 @@ int main() {
   gentle_shutdown_collects_ready_fd_wait();
   fd_wait_can_be_canceled_by_timeout();
 
+#if defined(CARDIO_TEST_KQUEUE)
+  std::puts("cardio_kqueue_test: PASS");
+#else
   std::puts("cardio_fd_test: PASS");
+#endif
   return 0;
 }
 #else

@@ -19,7 +19,12 @@
 
 #define CHECK_EQ(actual, expected) CHECK((actual) == (expected))
 
-#if CARDIO_HAS_WIN32_HANDLE
+#if defined(CARDIO_TEST_KQUEUE)
+#ifndef CARDIO_DISPATCHER_HOST_KQUEUE
+#error The kqueue dispatcher host must be available on this target.
+#endif
+using test_dispatcher_host = cardio::dispatcher_host_kqueue;
+#elif CARDIO_HAS_WIN32_HANDLE
 using test_dispatcher_host = cardio::dispatcher_host_win32;
 #else
 using test_dispatcher_host = cardio::dispatcher_host;

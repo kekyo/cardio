@@ -18,6 +18,10 @@
 #define CARDIO_WITH_GLIB 0
 #endif
 
+#ifndef CARDIO_WITH_CFRUNLOOP
+#define CARDIO_WITH_CFRUNLOOP 0
+#endif
+
 #ifndef CARDIO_WITH_GIO
 #define CARDIO_WITH_GIO 0
 #endif
@@ -98,7 +102,7 @@
 #else
 #define CARDIO_HAS_POSIX_FD 0
 #endif
-#elif defined(_POSIX_C_SOURCE) || defined(__ANDROID__)
+#elif defined(_POSIX_C_SOURCE) || defined(__ANDROID__) || defined(__APPLE__)
 #define CARDIO_HAS_POSIX_FD 1
 #else
 #define CARDIO_HAS_POSIX_FD 0
@@ -204,6 +208,22 @@
 #include <poll.h>
 #endif
 #include <unistd.h>
+#endif
+
+#if defined(__APPLE__) && CARDIO_HAS_POSIX_FD
+#define CARDIO_DISPATCHER_HOST_KQUEUE 1
+#include <map>
+#include <sys/event.h>
+#endif
+
+#if CARDIO_WITH_CFRUNLOOP
+#ifndef CARDIO_DISPATCHER_HOST_KQUEUE
+#error "CARDIO_WITH_CFRUNLOOP requires an Apple target with POSIX fd waits"
+#endif
+#include <CoreFoundation/CFDate.h>
+#include <CoreFoundation/CFFileDescriptor.h>
+#include <CoreFoundation/CFRunLoop.h>
+#define CARDIO_DISPATCHER_HOST_CFRUNLOOP 1
 #endif
 
 #if defined(__ANDROID__)
@@ -454,6 +474,9 @@ class dispatcher_host_glib_auto;
 #endif
 
 namespace internal {
+#ifdef CARDIO_DISPATCHER_HOST_CFRUNLOOP
+  class dispatcher_host_cfrunloop_base;
+#endif
 #if defined(__ANDROID__)
   class dispatcher_host_android_base;
 #endif
@@ -1515,9 +1538,183 @@ namespace internal {
     return events;
   }
 
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+  struct kqueue_tag {};
+
+  class kqueue_fd_wait_backend {
+    struct subscription {
+      std::vector<std::shared_ptr<fd_wait_state>> waits;
+      std::uintptr_t read_token = 0;
+      std::uintptr_t write_token = 0;
+      fd_event ready = fd_event::none;
+    };
+    int descriptor_;
+    std::map<int, subscription> subscriptions_;
+    std::vector<int> ready_fds_;
+    std::uintptr_t next_token_ = 0;
+
+    inline int change(const struct kevent& event) const noexcept {
+      int result;
+      do {
+        result = ::kevent(descriptor_, &event, 1, nullptr, 0, nullptr);
+      } while (result < 0 && errno == EINTR);
+      return result;
+    }
+
+    inline void mark_ready(int fd, subscription& entry, fd_event events) {
+      if (entry.ready == fd_event::none) ready_fds_.push_back(fd);
+      entry.ready |= events;
+    }
+
+    inline void update_filter(int fd, subscription& entry, short filter,
+                              std::uintptr_t& token, bool wanted) {
+      if (wanted == (token != 0)) return;
+      struct kevent event{};
+      if (wanted) {
+        if ((entry.ready & fd_event::error) != fd_event::none) return;
+        // A stale delivery must not complete a new wait that reused the fd.
+        if (++next_token_ == 0) ++next_token_;
+        EV_SET(&event, fd, filter, EV_ADD | EV_ONESHOT, 0, 0,
+               reinterpret_cast<void*>(next_token_));
+        if (change(event) == 0) {
+          token = next_token_;
+        } else {
+          // Match poll's error readiness even if the fd was closed before registration.
+          mark_ready(fd, entry, fd_event::error);
+          notify();
+        }
+      } else {
+        EV_SET(&event, fd, filter, EV_DELETE, 0, 0, nullptr);
+        (void)change(event);  // A one-shot event may already be in flight.
+        token = 0;
+      }
+    }
+
+    inline void update_interests(int fd, subscription& entry) {
+      auto interests = fd_event::none;
+      for (const auto& wait : entry.waits) interests |= wait->interests;
+      update_filter(fd, entry, EVFILT_READ, entry.read_token,
+                    (interests & fd_event::read) != fd_event::none);
+      update_filter(fd, entry, EVFILT_WRITE, entry.write_token,
+                    (interests & fd_event::write) != fd_event::none);
+      if (entry.waits.empty()) subscriptions_.erase(fd);
+    }
+
+  public:
+    inline kqueue_fd_wait_backend() : descriptor_(::kqueue()) {
+      if (descriptor_ < 0) fail_system_error(errno, "cardio: kqueue failed");
+      struct kevent event{};
+      EV_SET(&event, 0, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, nullptr);
+      if (::fcntl(descriptor_, F_SETFD, FD_CLOEXEC) == -1 || change(event) == -1) {
+        const auto error = errno;
+        ::close(descriptor_);
+        fail_system_error(error, "cardio: cannot initialize kqueue");
+      }
+    }
+    inline ~kqueue_fd_wait_backend() { ::close(descriptor_); }
+    kqueue_fd_wait_backend(const kqueue_fd_wait_backend&) = delete;
+    kqueue_fd_wait_backend& operator=(const kqueue_fd_wait_backend&) = delete;
+
+    inline int descriptor() const noexcept { return descriptor_; }
+    inline bool empty() const noexcept { return subscriptions_.empty(); }
+    inline void notify() const noexcept {
+      struct kevent event{};
+      EV_SET(&event, 0, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
+      (void)change(event);
+    }
+
+    inline void register_wait(const std::shared_ptr<fd_wait_state>& wait) {
+      auto& entry = subscriptions_[wait->fd];
+      entry.waits.push_back(wait);
+      update_interests(wait->fd, entry);
+    }
+
+    inline void unregister_wait(const std::shared_ptr<fd_wait_state>& wait) noexcept {
+      const auto found = subscriptions_.find(wait->fd);
+      if (found == subscriptions_.end()) return;
+      auto& entry = found->second;
+      std::erase(entry.waits, wait);
+      update_interests(wait->fd, entry);
+    }
+
+    inline void clear() noexcept {
+      for (auto& [fd, entry] : subscriptions_) {
+        for (auto& wait : entry.waits) {
+          wait->registered = false;
+          wait->owner = nullptr;
+        }
+      }
+      subscriptions_.clear();
+      ready_fds_.clear();
+    }
+
+    // Only the parking thread blocks here. Registration and cancellation can
+    // proceed under the dispatcher's mutex while the kernel owns this wait.
+    static inline void wait(int descriptor, int milliseconds, std::vector<struct kevent>& events) {
+      struct timespec timeout{milliseconds / 1000, (milliseconds % 1000) * 1000000L};
+      const struct timespec zero{};
+      const auto* remaining = milliseconds < 0 ? nullptr : &timeout;
+      struct kevent batch[32];
+      for (;;) {
+        const auto count = ::kevent(descriptor, nullptr, 0, batch, 32, remaining);
+        if (count < 0) {
+          if (errno == EINTR) return;  // Recompute the timer deadline in park().
+          fail_system_error(errno, "cardio: kevent wait failed");
+        }
+        events.insert(events.end(), batch, batch + count);
+        if (count < 32) return;
+        remaining = &zero;  // Collect both filters even across a batch boundary.
+      }
+    }
+
+    inline std::vector<std::coroutine_handle<>> collect_ready(
+        const std::vector<struct kevent>& events) {
+      for (const auto& event : events) {
+        if (event.filter == EVFILT_USER) continue;
+        const auto fd = static_cast<int>(event.ident);
+        const auto found = subscriptions_.find(fd);
+        if (found == subscriptions_.end()) continue;
+        auto& entry = found->second;
+        auto& token = event.filter == EVFILT_READ ? entry.read_token : entry.write_token;
+        if (token == 0 || token != reinterpret_cast<std::uintptr_t>(event.udata)) continue;
+        token = 0;  // EV_ONESHOT removed this filter.
+        auto ready = event.filter == EVFILT_READ ? fd_event::read : fd_event::write;
+        if (event.flags & EV_EOF) ready |= fd_event::hangup;
+        if ((event.flags & EV_ERROR) || ((event.flags & EV_EOF) && event.fflags)) {
+          ready |= fd_event::error;
+        }
+        mark_ready(fd, entry, ready);
+      }
+
+      auto continuations = std::vector<std::coroutine_handle<>>{};
+      auto ready_fds = std::exchange(ready_fds_, {});
+      for (const auto fd : ready_fds) {
+        const auto found = subscriptions_.find(fd);
+        if (found == subscriptions_.end()) continue;
+        auto& entry = found->second;
+        const auto ready = std::exchange(entry.ready, fd_event::none);
+        std::erase_if(entry.waits, [&](const auto& wait) {
+          const auto result = ready & (wait->interests | fd_event::hangup | fd_event::error);
+          if (result == fd_event::none) return false;
+          wait->result = result;
+          wait->registered = false;
+          wait->owner = nullptr;
+          if (wait->continuation) continuations.push_back(wait->continuation);
+          return true;
+        });
+        update_interests(fd, entry);
+      }
+      return continuations;
+    }
+  };
+#endif
+
   class posix_fd_wait_backend {
   private:
     std::deque<std::shared_ptr<fd_wait_state>> waits_;
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+    std::unique_ptr<kqueue_fd_wait_backend> kqueue_;
+#endif
     int wakeup_read_fd_ = -1;
 #if !defined(ESP_PLATFORM)
     int wakeup_write_fd_ = -1;
@@ -1585,8 +1782,15 @@ namespace internal {
     struct snapshot {
       std::vector<pollfd> poll_fds;
       std::vector<std::shared_ptr<fd_wait_state>> waits;
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      int kqueue_fd = -1;
+      std::vector<struct kevent> events;
+#endif
 
       inline bool empty() const noexcept {
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+        if (kqueue_fd >= 0) return false;
+#endif
         return poll_fds.empty();
       }
     };
@@ -1641,11 +1845,23 @@ namespace internal {
     posix_fd_wait_backend(const posix_fd_wait_backend&) = delete;
     posix_fd_wait_backend& operator=(const posix_fd_wait_backend&) = delete;
 
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+    inline explicit posix_fd_wait_backend(kqueue_tag)
+        : kqueue_(std::make_unique<kqueue_fd_wait_backend>()) {}
+    inline int kqueue_descriptor() const noexcept { return kqueue_->descriptor(); }
+#endif
+
     inline bool empty() const noexcept {
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      if (kqueue_) return kqueue_->empty();
+#endif
       return waits_.empty();
     }
 
     inline void notify() noexcept {
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      if (kqueue_) return kqueue_->notify();
+#endif
 #if defined(ESP_PLATFORM)
       const auto value = uint64_t{1};
       const int fd = wakeup_read_fd_;
@@ -1672,6 +1888,9 @@ namespace internal {
       wait->continuation = continuation;
       wait->owner = owner;
       wait->registered = true;
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      if (kqueue_) return kqueue_->register_wait(wait);
+#endif
       waits_.push_back(std::move(wait));
     }
 
@@ -1684,6 +1903,12 @@ namespace internal {
 
       wait->owner = nullptr;
       wait->registered = false;
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      if (kqueue_) {
+        kqueue_->unregister_wait(wait);
+        return true;
+      }
+#endif
       for (auto iterator = waits_.begin(); iterator != waits_.end(); ++iterator) {
         if (iterator->get() == wait.get()) {
           waits_.erase(iterator);
@@ -1694,6 +1919,9 @@ namespace internal {
     }
 
     inline void clear(dispatcher* owner) noexcept {
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      if (kqueue_) return kqueue_->clear();
+#endif
       for (auto& wait : waits_) {
         if (wait && wait->owner == owner) {
           wait->owner = nullptr;
@@ -1707,6 +1935,12 @@ namespace internal {
         dispatcher* owner,
         bool include_wakeup_when_empty = false) {
       auto result = snapshot{};
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      if (kqueue_) {
+        if (include_wakeup_when_empty || !kqueue_->empty()) result.kqueue_fd = kqueue_->descriptor();
+        return result;
+      }
+#endif
       result.poll_fds.reserve(waits_.size() + 1);
       result.waits.reserve(waits_.size());
 
@@ -1772,6 +2006,9 @@ namespace internal {
     inline std::vector<std::coroutine_handle<>> collect_ready(
         dispatcher* owner,
         const snapshot& snapshot) {
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      if (kqueue_) return kqueue_->collect_ready(snapshot.events);
+#endif
       auto continuations = std::vector<std::coroutine_handle<>>{};
 
       if (!snapshot.poll_fds.empty() && snapshot.poll_fds[0].revents != 0) {
@@ -2650,6 +2887,9 @@ private:
   friend class dispatcher;
   friend struct internal::dispatcher_lifetime;
   friend class dispatcher_host;
+#ifdef CARDIO_DISPATCHER_HOST_CFRUNLOOP
+  friend class internal::dispatcher_host_cfrunloop_base;
+#endif
 #if defined(__ANDROID__)
   friend class internal::dispatcher_host_android_base;
 #endif
@@ -2855,6 +3095,12 @@ class dispatcher {
 private:
   friend class dispatcher_group;
   friend class dispatcher_host;
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+  friend class dispatcher_host_kqueue;
+#endif
+#ifdef CARDIO_DISPATCHER_HOST_CFRUNLOOP
+  friend class internal::dispatcher_host_cfrunloop_base;
+#endif
 #if defined(__ANDROID__)
   friend class internal::dispatcher_host_android_base;
 #endif
@@ -2991,6 +3237,8 @@ private:
 
   inline virtual void notify_external_event() noexcept {
   }
+
+  inline void park_native(shutdown_mode mode, park_policy policy);
 
 #if CARDIO_HAS_NATIVE_WAIT
   inline void mark_wait_polling(bool polling) noexcept {
@@ -3211,6 +3459,9 @@ private:
 
     inline bool empty() const noexcept {
 #if CARDIO_HAS_POSIX_FD
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      if (fd_snapshot.kqueue_fd >= 0) return false;
+#endif
       return poll_fds.empty();
 #elif CARDIO_HAS_WIN32_HANDLE
       return win32_handle_snapshot.empty();
@@ -3251,6 +3502,13 @@ private:
     }
 
 #if CARDIO_HAS_POSIX_FD
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+    if (snapshot.fd_snapshot.kqueue_fd >= 0) {
+      internal::kqueue_fd_wait_backend::wait(snapshot.fd_snapshot.kqueue_fd,
+          timeout_milliseconds, snapshot.fd_snapshot.events);
+      return;
+    }
+#endif
     internal::fd_wait_backend::wait(snapshot.poll_fds, timeout_milliseconds);
 
     for (auto index = std::size_t{0};
@@ -3941,6 +4199,18 @@ private:
 #endif
 
 protected:
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+  // Create the kernel queue before publishing this dispatcher in the group.
+  inline dispatcher(internal::kqueue_tag tag, dispatcher_group* shared_group,
+                    bool register_immediately = true)
+      : features_(default_features()),
+        owned_group_(shared_group ? nullptr : std::make_unique<dispatcher_group>()),
+        group_(shared_group ? shared_group : owned_group_.get()),
+        lifetime_(std::make_shared<internal::dispatcher_lifetime>(this, group_->lifetime_)),
+        fd_waits_(tag) {
+    if (register_immediately) group_->register_dispatcher(this);
+  }
+#endif
   /**
    * Creates a dispatcher base.
    *
@@ -4119,6 +4389,14 @@ public:
   inline void park(
       shutdown_mode mode = shutdown_mode::gentle,
       park_policy policy = park_policy::external_pump_first) {
+    park_native(mode, policy);
+  }
+
+  dispatcher_host(const dispatcher_host&) = delete;
+  dispatcher_host& operator=(const dispatcher_host&) = delete;
+};
+
+inline void dispatcher::park_native(shutdown_mode mode, park_policy policy) {
     if (owner_thread_id_ != internal::thread_id{} &&
         !is_current_thread_owner()) {
       internal::fail_runtime_error(
@@ -4311,11 +4589,308 @@ public:
         execute_dequeued_work(work, {}, mode);
       }
     }
+}
+
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+/**
+ * Dispatches continuations, timers and POSIX fd readiness using an Apple kqueue.
+ * @remarks The application drives this host by calling park(). Registered fds
+ * remain owned by the caller.
+ */
+class dispatcher_host_kqueue final : public dispatcher {
+public:
+  /**
+   * Creates a host with its own dispatcher group.
+   * @param policy Whether to bind execution to the constructing thread.
+   * @throws std::system_error If the kernel event queue cannot be initialized.
+   */
+  inline explicit dispatcher_host_kqueue(
+      dispatcher_thread_policy policy = dispatcher_thread_policy::any_thread)
+      : dispatcher(internal::kqueue_tag{}, nullptr) {
+    if (policy == dispatcher_thread_policy::current_thread) {
+      owner_thread_id_ = internal::current_thread_id();
+    }
   }
 
-  dispatcher_host(const dispatcher_host&) = delete;
-  dispatcher_host& operator=(const dispatcher_host&) = delete;
+  /**
+   * Creates a host in an existing dispatcher group.
+   * @param group Group coordinating shutdown and outstanding work.
+   * @param policy Whether to bind execution to the constructing thread.
+   * @throws std::system_error If the kernel event queue cannot be initialized.
+   */
+  inline explicit dispatcher_host_kqueue(dispatcher_group& group,
+      dispatcher_thread_policy policy = dispatcher_thread_policy::any_thread)
+      : dispatcher(internal::kqueue_tag{}, &group) {
+    if (policy == dispatcher_thread_policy::current_thread) {
+      owner_thread_id_ = internal::current_thread_id();
+    }
+  }
+
+  /**
+   * Runs queued work and waits for timers and registered file descriptors.
+   * @param mode How to handle outstanding work when the group shuts down.
+   */
+  inline void park(shutdown_mode mode = shutdown_mode::gentle) {
+    park_native(mode, park_policy::continuation_first);
+  }
 };
+#endif
+
+#ifdef CARDIO_DISPATCHER_HOST_CFRUNLOOP
+namespace internal {
+  class dispatcher_host_cfrunloop_base : public dispatcher {
+    CFRunLoopRef loop_ = nullptr;
+    CFRunLoopSourceRef work_source_ = nullptr;
+    CFFileDescriptorRef descriptor_ = nullptr;
+    CFRunLoopSourceRef fd_source_ = nullptr;
+    CFRunLoopTimerRef timer_ = nullptr;
+    std::optional<std::chrono::steady_clock::time_point> armed_deadline_;
+    internal::mutex wake_mutex_;
+    bool attached_ = false;
+    shutdown_mode mode_ = shutdown_mode::gentle;
+
+    inline void discard_timer() noexcept {
+      armed_deadline_.reset();
+      if (timer_) {
+        CFRunLoopTimerInvalidate(timer_);
+        CFRelease(timer_);
+        timer_ = nullptr;
+      }
+    }
+
+    inline void refresh_timer() {
+      std::optional<std::chrono::steady_clock::time_point> deadline;
+      {
+        auto lock = std::lock_guard<internal::mutex>(mutex_);
+        deadline = next_timer_deadline();
+      }
+      if (deadline == armed_deadline_) return;
+      discard_timer();
+      if (!deadline) return;
+      // Cardio deadlines are monotonic. Recheck that deadline when CF fires.
+      const std::chrono::duration<double> remaining = *deadline - std::chrono::steady_clock::now();
+      CFRunLoopTimerContext context{};
+      context.info = this;
+      timer_ = CFRunLoopTimerCreate(nullptr, CFAbsoluteTimeGetCurrent() + std::max(0.0, remaining.count()),
+          0, 0, 0, [](CFRunLoopTimerRef, void* info) {
+            auto& host = *static_cast<dispatcher_host_cfrunloop_base*>(info);
+            host.discard_timer();
+            host.perform();
+          }, &context);
+      if (!timer_) fail_runtime_error("cardio: cannot create CFRunLoop timer");
+      armed_deadline_ = deadline;
+      CFRunLoopAddTimer(loop_, timer_, kCFRunLoopCommonModes);
+    }
+
+    inline bool dispatch_one() {
+      if (group_->should_exit_immediately(mode_)) return false;
+      dispatcher::wait_snapshot snapshot;
+      {
+        auto lock = std::lock_guard<internal::mutex>(mutex_);
+        snapshot = make_wait_snapshot();
+      }
+      wait_for_snapshot(snapshot, 0);
+      collect_ready_wait_snapshot(snapshot);
+      work_item work;
+      {
+        auto lock = std::lock_guard<internal::mutex>(mutex_);
+        if (!queue_.empty() && !group_->should_exit_immediately(mode_)) {
+          work = std::move(queue_.front());
+          queue_.pop_front();
+          ++active_continuations_;
+        }
+      }
+      if (work) {
+        // Two sources on the same run loop can belong to different dispatchers.
+        auto& current = internal::runtime_state().current_dispatcher;
+        struct restore_current {
+          dispatcher*& slot;
+          dispatcher* previous;
+          ~restore_current() { slot = previous; }
+        } scope{current, std::exchange(current, this)};
+        execute_dequeued_work(work, {}, mode_);
+      }
+      refresh_timer();
+      {
+        auto lock = std::lock_guard<internal::mutex>(mutex_);
+        if (!queue_.empty()) notify_external_event();
+      }
+      return static_cast<bool>(work);
+    }
+
+    inline void perform() noexcept {
+      if (!attached_) return;
+#if CARDIO_HAS_EXCEPTIONS
+      try {
+        dispatch_one();
+      } catch (...) {
+        handle_unhandled_exception(std::current_exception());
+      }
+#else
+      dispatch_one();
+#endif
+    }
+
+    inline void attach() {
+      CFRunLoopAddSource(loop_, work_source_, kCFRunLoopCommonModes);
+      CFRunLoopAddSource(loop_, fd_source_, kCFRunLoopCommonModes);
+      attached_ = true;
+      CFFileDescriptorEnableCallBacks(descriptor_, kCFFileDescriptorReadCallBack);
+      notify_external_event();
+    }
+
+    inline void detach() noexcept {
+      if (!attached_) return;
+      attached_ = false;
+      CFFileDescriptorDisableCallBacks(descriptor_, kCFFileDescriptorReadCallBack);
+      CFRunLoopRemoveSource(loop_, fd_source_, kCFRunLoopCommonModes);
+      CFRunLoopRemoveSource(loop_, work_source_, kCFRunLoopCommonModes);
+      discard_timer();
+    }
+
+    inline void dispose() noexcept {
+      detach();
+      if (fd_source_) {
+        CFRunLoopSourceInvalidate(fd_source_);
+        CFRelease(fd_source_);
+      }
+      if (descriptor_) {
+        CFFileDescriptorInvalidate(descriptor_);
+        CFRelease(descriptor_);
+      }
+      auto lock = std::lock_guard<internal::mutex>(wake_mutex_);
+      if (work_source_) {
+        CFRunLoopSourceInvalidate(work_source_);
+        CFRelease(work_source_);
+        work_source_ = nullptr;
+      }
+      if (loop_) CFRelease(loop_);
+      loop_ = nullptr;
+    }
+
+    inline void notify_external_event() noexcept override {
+      auto lock = std::lock_guard<internal::mutex>(wake_mutex_);
+      if (work_source_) {
+        CFRunLoopSourceSignal(work_source_);
+        CFRunLoopWakeUp(loop_);
+      }
+    }
+
+  protected:
+    inline dispatcher_host_cfrunloop_base(dispatcher_group* shared_group, bool automatic)
+        : dispatcher(kqueue_tag{}, shared_group, false) {
+      owner_thread_id_ = internal::current_thread_id();
+      loop_ = CFRunLoopGetCurrent();
+      CFRetain(loop_);
+      CFRunLoopSourceContext work_context{};
+      work_context.info = this;
+      work_context.perform = [](void* info) { static_cast<dispatcher_host_cfrunloop_base*>(info)->perform(); };
+      work_source_ = CFRunLoopSourceCreate(nullptr, 0, &work_context);
+      CFFileDescriptorContext fd_context{};
+      fd_context.info = this;
+      // The dispatcher owns the kqueue. CF only observes its read readiness.
+      descriptor_ = CFFileDescriptorCreate(nullptr, fd_waits_.kqueue_descriptor(), false,
+          [](CFFileDescriptorRef descriptor, CFOptionFlags, void* info) {
+            auto& host = *static_cast<dispatcher_host_cfrunloop_base*>(info);
+            host.perform();
+            if (host.attached_) CFFileDescriptorEnableCallBacks(descriptor, kCFFileDescriptorReadCallBack);
+          }, &fd_context);
+      if (descriptor_) fd_source_ = CFFileDescriptorCreateRunLoopSource(nullptr, descriptor_, 0);
+      if (!work_source_ || !fd_source_) {
+        dispose();
+        fail_runtime_error("cardio: cannot create CFRunLoop sources");
+      }
+#if CARDIO_HAS_EXCEPTIONS
+      try {
+#endif
+        if (automatic) attach();
+        group_->register_dispatcher(this);
+#if CARDIO_HAS_EXCEPTIONS
+      } catch (...) {
+        dispose();
+        throw;
+      }
+#endif
+    }
+
+    inline ~dispatcher_host_cfrunloop_base() override {
+      group_->unregister_dispatcher(this);
+      dispose();
+    }
+
+    inline void park_loop(shutdown_mode mode) {
+      if (!is_current_thread_owner()) fail_runtime_error("cardio: CFRunLoop must be parked on its owner thread");
+      if (attached_) fail_runtime_error("cardio: CFRunLoop dispatcher is already parked");
+      mode_ = mode;
+      attach();
+      struct detach_on_return {
+        dispatcher_host_cfrunloop_base& host;
+        ~detach_on_return() { host.detach(); }
+      } scope{*this};
+      for (;;) {
+        if (group_->should_exit(mode)) {
+          // Gentle shutdown still delivers already-ready timers and fds.
+          if (mode == shutdown_mode::gentle && group_->is_shutdown_requested() && dispatch_one()) continue;
+          return;
+        }
+        const auto result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0e10, true);
+        if (result == kCFRunLoopRunStopped || result == kCFRunLoopRunFinished) return;
+      }
+    }
+  };
+}  // namespace internal
+
+/**
+ * Drives both cardio work and application sources on the current CFRunLoop.
+ * @remarks Construct, park and destroy the host on the run loop's owner thread.
+ */
+class dispatcher_host_cfrunloop final : public internal::dispatcher_host_cfrunloop_base {
+public:
+  /**
+   * Creates a host with its own group on the current thread.
+   * @throws std::system_error If the kernel event queue cannot be created.
+   * @throws std::runtime_error If the run loop sources cannot be created.
+   */
+  inline dispatcher_host_cfrunloop() : dispatcher_host_cfrunloop_base(nullptr, false) {}
+  /**
+   * Creates a host on the current thread in an existing dispatcher group.
+   * @param group Group coordinating shutdown and outstanding work.
+   * @throws std::system_error If the kernel event queue cannot be created.
+   * @throws std::runtime_error If the run loop sources cannot be created.
+   */
+  inline explicit dispatcher_host_cfrunloop(dispatcher_group& group)
+      : dispatcher_host_cfrunloop_base(&group, false) {}
+  /**
+   * Runs the default run loop mode and dispatches cardio work until the group exits.
+   * @param mode How to handle outstanding work at shutdown.
+   * @throws std::runtime_error When parked recursively or on another thread.
+   */
+  inline void park(shutdown_mode mode = shutdown_mode::gentle) { park_loop(mode); }
+};
+
+/**
+ * Dispatches cardio work from an existing CFRunLoop, including AppKit and UIKit main loops.
+ * @remarks Construct and destroy the host on the loop's owner thread. Sources
+ * and timers participate in common modes while the application drives its loop.
+ */
+class dispatcher_host_cfrunloop_auto final : public internal::dispatcher_host_cfrunloop_base {
+public:
+  /**
+   * Attaches to the current run loop with an implicit dispatcher group.
+   * @throws std::system_error If the kernel event queue cannot be created.
+   * @throws std::runtime_error If the run loop sources cannot be created.
+   */
+  inline dispatcher_host_cfrunloop_auto() : dispatcher_host_cfrunloop_base(nullptr, true) {}
+  /**
+   * Attaches to the current run loop in an existing dispatcher group.
+   * @param group Group coordinating shutdown and outstanding work.
+   * @throws std::system_error If the kernel event queue cannot be created.
+   * @throws std::runtime_error If the run loop sources cannot be created.
+   */
+  inline explicit dispatcher_host_cfrunloop_auto(dispatcher_group& group)
+      : dispatcher_host_cfrunloop_base(&group, true) {}
+};
+#endif
 
 #if CARDIO_HAS_WIN32_HANDLE
 /**

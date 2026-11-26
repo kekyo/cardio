@@ -36,6 +36,55 @@ env:
   ANDROID_EMULATOR_REVISION: "37.2.12"
 
 jobs:
+  ios:
+    name: iOS SDKs and UIKit Simulator
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check device and simulator builds and run the UIKit app
+        run: sh tests/ios/verify.sh build/ios
+
+  macos:
+    name: macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+            minimum: "10.13"
+          - runner: macos-15
+            arch: arm64
+            minimum: "11.0"
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.minimum }}
+      EXPECTED_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and run native tests
+        run: |
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          xcodebuild -version
+          if ! command -v gmake >/dev/null; then brew install make; fi
+          CXX="xcrun --sdk macosx clang++" CXXOPT="-O2 -g" ./build.sh
+          minimum=$(xcrun otool -l build/cardio_fd_test | awk '
+            $1 == "cmd" { deployment = $2 == "LC_BUILD_VERSION" || $2 == "LC_VERSION_MIN_MACOSX" }
+            deployment && ($1 == "minos" || $1 == "version") { print $2; deployment = 0 }
+          ')
+          echo "Mach-O minimum macOS: $minimum"
+          test "$minimum" = "$MACOSX_DEPLOYMENT_TARGET"
+          echo "$GITHUB_SHA · $EXPECTED_ARCH · deployment $minimum · tested on macOS $(sw_vers -productVersion) · [run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)" >> "$GITHUB_STEP_SUMMARY"
+
   espidf:
     name: ESP-IDF (QEMU)
     if: inputs.android_test_target != 'test-android-control'
