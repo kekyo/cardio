@@ -36,6 +36,19 @@ env:
   ANDROID_EMULATOR_REVISION: "37.2.12"
 
 jobs:
+  ios:
+    name: iOS SDKs and UIKit Simulator
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check device and simulator builds and run the UIKit app
+        run: sh tests/ios/verify.sh build/ios
+
   macos:
     name: macOS (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}

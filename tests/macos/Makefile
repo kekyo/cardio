@@ -46,3 +46,7 @@ test-macos: $(MACOS_NATIVE_TESTS) $(BUILD_DIR)/cardio_fd_test
 	@set -e; for binary in $(MACOS_NATIVE_TESTS); do "$$binary"; done
 	@set -e; output=$$("$(BUILD_DIR)/cardio_fd_test"); printf '%s\n' "$$output"; \
 		printf '%s\n' "$$output" | grep -Fxq 'cardio_fd_test: PASS'
+
+.PHONY: test-ios
+test-ios:
+	sh tests/ios/verify.sh "$(BUILD_DIR)/ios"
