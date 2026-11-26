@@ -17,10 +17,13 @@ static cardio::promise<void> exercise_ui_loop() {
     source.resolve();
     CHECK_EQ(::write(fds[1], "i", 1), 1);
   });
+  std::puts("Waiting for the worker's notification");
   co_await posted;
   CHECK([NSThread isMainThread]);
+  std::puts("Waiting for the timer");
   co_await cardio::promises::delay(2);
   CHECK([NSThread isMainThread]);
+  std::puts("Waiting for the pipe");
   const auto events = co_await read;
   CHECK((events & cardio::fd_event::read) != cardio::fd_event::none);
   CHECK([NSThread isMainThread]);
@@ -48,6 +51,7 @@ static cardio::promise<void> exercise_ui_loop() {
   (void)scene;
   (void)session;
   (void)options;
+  std::puts("UIKit scene connected");
   static cardio::dispatcher_host_cfrunloop_auto host;
   static auto root = exercise_ui_loop();
   (void)root;
@@ -56,6 +60,11 @@ static cardio::promise<void> exercise_ui_loop() {
 
 int main(int argc, char** argv) {
   @autoreleasepool {
+    if (const auto* report = std::getenv("CARDIO_TEST_REPORT")) {
+      CHECK(std::freopen(report, "w", stdout) != nullptr);
+      CHECK_EQ(std::setvbuf(stdout, nullptr, _IONBF, 0), 0);
+    }
+    std::puts("Starting UIKit");
     ::alarm(60);
     return UIApplicationMain(argc, argv, nil, NSStringFromClass([CardioAppDelegate class]));
   }

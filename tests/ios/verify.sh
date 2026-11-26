@@ -35,9 +35,22 @@ device=$(xcrun simctl create CardioRunLoopTest com.apple.CoreSimulator.SimDevice
 trap 'xcrun simctl shutdown "$device" >/dev/null 2>&1 || true; xcrun simctl delete "$device"' EXIT
 xcrun simctl bootstatus "$device" -b
 xcrun simctl install "$device" "$app"
-xcrun simctl launch --console "$device" com.example.cardio.runloop-test > "$output/launch.log" 2>&1 || {
-    cat "$output/launch.log" >&2
-    exit 1
-}
+bundle=com.example.cardio.runloop-test
+data=$(xcrun simctl get_app_container "$device" "$bundle" data)
+# Keep the app's result even if simctl forwards only its launch PID.
+report=$(mktemp "$data/tmp/cardio-runloop.XXXXXX")
+status=0
+SIMCTL_CHILD_CARDIO_TEST_REPORT="$report" xcrun simctl launch --console "$device" "$bundle" \
+    > "$output/launch.log" 2>&1 || status=$?
 cat "$output/launch.log"
-grep -Fxq 'cardio_ios_cfrunloop_test: PASS' "$output/launch.log"
+cp "$report" "$output/app.log"
+cat "$output/app.log"
+if [ "$status" -eq 0 ] && grep -Fxq 'cardio_ios_cfrunloop_test: PASS' "$output/app.log"; then
+    exit 0
+fi
+
+echo "UIKit test did not complete (simctl launch status $status)" >&2
+xcrun simctl spawn "$device" log show --last 5m --style compact --info \
+    --predicate 'process == "cardio_runloop_test" OR eventMessage CONTAINS[c] "com.example.cardio.runloop-test"' >&2 || true
+if [ "$status" -ne 0 ]; then exit "$status"; fi
+exit 1
