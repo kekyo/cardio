@@ -13,11 +13,15 @@ mkdir -p "$ndk_bin"
 ln -s /bin/true "$ndk_bin/x86_64-linux-android24-clang++"
 
 cat > Makefile <<'EOF'
-test test-win32 test-android:
+test test-win32 test-android macos-cross:
 	@echo '$(filter -j%,$(MAKEFLAGS))' > $@
 EOF
 "$root/build.sh"
-for target in test test-win32 test-android; do
+targets='test test-win32 test-android'
+if [ "$(uname -sm)" = "Linux x86_64" ]; then
+    targets="$targets macos-cross"
+fi
+for target in $targets; do
     jobs=$(cat "$target")
     case "$jobs" in
         ''|-j[1-4]) ;;

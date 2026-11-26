@@ -393,3 +393,4 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 include tests/android/control/Makefile
+include tests/macos/Makefile

@@ -4,6 +4,9 @@ set -e
 
 # Each concurrent C++ compilation also starts a CodeQL extractor in CI.
 build_jobs=4
+if [ "$(uname -sm)" = "Linux x86_64" ]; then
+    make -j"$build_jobs" macos-cross
+fi
 make -j"$build_jobs" test
 make -j"$build_jobs" test-win32
 
