@@ -1,8 +1,9 @@
 # Waiting for POSIX File Descriptors
 
 In POSIX environments, file descriptor readiness can be awaited as a `promise`.
-This feature is exposed only in builds where `_POSIX_C_SOURCE` or
-`CARDIO_HAS_POSIX_FD=1` is enabled.
+Apple and Android targets enable this feature by default, as do POSIX targets
+that define `_POSIX_C_SOURCE`. ESP-IDF uses `CONFIG_VFS_SUPPORT_SELECT`.
+Applications can check availability with `#if CARDIO_HAS_POSIX_FD`.
 In non-POSIX builds, `fd_event` and `from_fd()` are not exposed.
 `cardio::from_fd()` waits until the specified file descriptor becomes readable or
 writable, and returns the actual state that occurred as `fd_event`:

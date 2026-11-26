@@ -75,13 +75,15 @@ int main() {
 
 ### Environment
 
-- C++20 compiler (GNU g++, and probably clang)
+- C++20 compiler (GNU g++, Clang, or Apple Clang)
 - POSIX environment (Core functionality will work in non-POSIX environments as long as the major C++20 libraries are available)
-- Windows (optional, Win32 handle and OVERLAPPED wait support)
 - Linux (optional, io_uring support)
-- Android API 24 or newer (optional, Android Looper integration)
-- ESP-IDF 6.0 (primary target ESP32-S3)
 - GLib 2/GTK (optional)
+- Android API 24 or newer (optional, Android Looper integration)
+- ESP-IDF 6.0 (optional, primary target ESP32-S3)
+- Windows (optional, Win32 handle and OVERLAPPED wait support)
+- macOS (experimental, minimum deployment targets 10.13 on Intel and 11.0 on Apple Silicon)
+- iOS (experimental, minimum deployment target 15.0, UIKit integration tested in Simulator)
 
 ---
 
@@ -105,10 +107,11 @@ Copy [`cardio.h`](./include/cardio.h) into your project and include it. That is 
 
 - [Waiting for POSIX File Descriptors](./docs/en/posix-fd.md)
 - [Implementing Asynchronous I/O With Linux io_uring](./docs/en/linux-io-uring.md)
-- [Win32 Handle Waits and I/O Completion Ports](./docs/en/win32.md)
-- [Integration With Android Looper](./docs/en/android-looper.md)
 - [GLib/GTK Integration and GIO File I/O](./docs/en/glib-gio.md)
+- [Integration With Android Looper](./docs/en/android-looper.md)
 - [Using FreeRTOS tasks on ESP-IDF](./docs/en/esp-idf.md)
+- [Dispatchers and Event Loops on macOS and iOS](./docs/en/apple-dispatchers.md)
+- [Win32 Handle Waits and I/O Completion Ports](./docs/en/win32.md)
 
 ### Advanced Topics
 

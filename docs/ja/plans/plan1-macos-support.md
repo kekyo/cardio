@@ -137,3 +137,16 @@ macOS の両ランナーで手動・自動のテストを実行する。別ス�
 iOS 15 を最低ターゲットの候補とする。Xcode の実機用 SDK（`iphoneos`）と Simulator 用 SDK（`iphonesimulator`）で、標準ホストと `from_fd()` を使う小さな C++ プログラムをビルドする。両 SDK でコンパイル・リンクできれば iOS のビルド確認は完了とし、結果には使用した SDK を記録する。[Xcode と iOS の対応表](https://developer.apple.com/xcode/system-requirements)
 
 iOS でも追加ホストを有効にする場合は、同じ公開マクロで選んだホストを両 SDK でリンクする。UIKit との動作確認は Simulator 上で行う。メインループを動かしたまま別スレッドから投稿し、投稿したコールバック、タイマー、fd の継続がメインスレッドで実行され、監視解除後も fd が使えることを確かめる。ビルドのみ確認した構成と Simulator で実行した構成は、対応表にそれぞれ記録する。[Simulator でのテスト](https://developer.apple.com/library/archive/technotes/tn2339/_index.html)
+
+## 実施結果
+
+| 段階 | 確認した内容 | 記録 |
+| --- | --- | --- |
+| 1. Zig の取得 | Zig をインストールしていない Linux x86_64 で通常のビルドを起動し、1回の取得で両 CPU の実行ファイルを生成した。配置後のオフライン再ビルド、取得中断とハッシュ不一致の後の再取得も確認した。 | [自動取得の実装 afc848b](https://github.com/kekyo/cardio/commit/afc848b) |
+| 2. 標準ホスト | Apple の既定値を確認するテストは変更前に両 CPU で失敗し、変更後は fd の強制指定を外しても両方でリンクできた。Linux の標準テスト一式と、Clang・libc++ での共通テストも通過した。 | [既定値とテスト 81445aa](https://github.com/kekyo/cardio/commit/81445aa) |
+| 3. `poll()` | Intel は最低ターゲット 10.13、実行 OS 15.7.9。arm64 は最低ターゲット 11.0、実行 OS 15.8.2。両方で `cardio_fd_test: PASS` と Mach-O の最低 OS を確認してから段階4に進んだ。 | [2bf18d8 の macOS テスト](https://github.com/kekyo/cardio/actions/runs/45799219751) |
+| 4. `kqueue` | 両 CPU で標準版と同じ fd テストを実行した。重複した待機のキャンセル、40組のソケットの同時通知、タイマー、他スレッドからの起床、shutdown が通過した。 | [01f17aa の macOS テスト](https://github.com/kekyo/cardio/actions/runs/45800337931) |
+| 5. `CFRunLoop` | 両 CPU で手動・自動ホストを検証した。アプリ独自のイベント、別スレッドからの通知、タイマー、fd の継続が所有スレッドで動作した。自動ホストは既定以外の共通モードでも動作し、待機を取り消してホストを破棄した後も元の fd は使えた。 | [31c71d0 の Intel テスト](https://github.com/kekyo/cardio/actions/runs/45802233648/job/139848387320)・[arm64 テスト](https://github.com/kekyo/cardio/actions/runs/45802233648/job/139848387340) |
+| 6. iOS | 最低ターゲットを 15.0 とし、実機用・Simulator 用の両 SDK 18.5 で標準版、`kqueue` 版、Core Foundation 版とホスト選択例をリンクした。iPhone 16 Simulator（iOS 18.5）で UIKit のイベントループを動かし、`cardio_ios_cfrunloop_test: PASS` を確認した。 | [31c71d0 の iOS テスト](https://github.com/kekyo/cardio/actions/runs/45802233648/job/139848387233) |
+
+段階5では公開 API の `promise_source::resolve()` を別スレッドで呼び、待機中のコルーチンがループの所有スレッドで再開することを確認した。手動・自動のホストを選ぶ公開例は Core Foundation を有効・無効にした macOS、Linux、Win32、Android 向けにビルドした。[ホスト選択のテスト](../../../tests/cardio_host_selection_test.cpp)

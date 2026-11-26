@@ -72,13 +72,15 @@ int main() {
 
 ### 環境
 
-- C++20コンパイラ (GNU g++, 恐らくclangでも動作可能)
+- C++20 コンパイラ（GNU g++、Clang、Apple Clang）
 - POSIX環境 (非POSIX環境でもC++20の主要なライブラリがあれば、コア機能は動作します)
-- Windows (optional, Win32 HANDLE and OVERLAPPED wait support)
 - Linux (optional, io_uring support)
-- Android API 24以降 (optional, Android Looper integration)
-- ESP-IDF 6.0（主対象はESP32-S3）
 - GLib 2/GTK (optional)
+- Android API 24以降 (optional, Android Looper integration)
+- ESP-IDF 6.0（optional, 主対象はESP32-S3）
+- Windows (optional, Win32 HANDLE and OVERLAPPED wait support)
+- macOS（experimental。最低ターゲットは Intel 10.13、Apple Silicon 11.0）
+- iOS（experimental。最低ターゲット 15.0、UIKit との統合は Simulator で実行確認）
 
 ---
 
@@ -102,10 +104,11 @@ int main() {
 
 - [POSIXファイルディスクリプタの待機](./docs/ja/posix-fd.md)
 - [Linux io_uringで非同期I/Oを実装](./docs/ja/linux-io-uring.md)
-- [Win32 HANDLEの待機とI/O完了ポート](./docs/ja/win32.md)
-- [Android Looperとの統合](./docs/ja/android-looper.md)
 - [GLib・GTKとの統合とGIOファイルI/O](./docs/ja/glib-gio.md)
+- [Android Looperとの統合](./docs/ja/android-looper.md)
 - [ESP-IDFでFreeRTOSタスクを使う](./docs/ja/esp-idf.md)
+- [macOS・iOS の dispatcher とイベントループ](./docs/ja/apple-dispatchers.md)
+- [Win32 HANDLEの待機とI/O完了ポート](./docs/ja/win32.md)
 
 ### 応用
 

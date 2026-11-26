@@ -4846,11 +4846,17 @@ namespace internal {
  */
 class dispatcher_host_cfrunloop final : public internal::dispatcher_host_cfrunloop_base {
 public:
-  /** Creates a host with its own group on the current thread. */
+  /**
+   * Creates a host with its own group on the current thread.
+   * @throws std::system_error If the kernel event queue cannot be created.
+   * @throws std::runtime_error If the run loop sources cannot be created.
+   */
   inline dispatcher_host_cfrunloop() : dispatcher_host_cfrunloop_base(nullptr, false) {}
   /**
    * Creates a host on the current thread in an existing dispatcher group.
    * @param group Group coordinating shutdown and outstanding work.
+   * @throws std::system_error If the kernel event queue cannot be created.
+   * @throws std::runtime_error If the run loop sources cannot be created.
    */
   inline explicit dispatcher_host_cfrunloop(dispatcher_group& group)
       : dispatcher_host_cfrunloop_base(&group, false) {}
@@ -4869,11 +4875,17 @@ public:
  */
 class dispatcher_host_cfrunloop_auto final : public internal::dispatcher_host_cfrunloop_base {
 public:
-  /** Attaches to the current run loop with an implicit dispatcher group. */
+  /**
+   * Attaches to the current run loop with an implicit dispatcher group.
+   * @throws std::system_error If the kernel event queue cannot be created.
+   * @throws std::runtime_error If the run loop sources cannot be created.
+   */
   inline dispatcher_host_cfrunloop_auto() : dispatcher_host_cfrunloop_base(nullptr, true) {}
   /**
    * Attaches to the current run loop in an existing dispatcher group.
    * @param group Group coordinating shutdown and outstanding work.
+   * @throws std::system_error If the kernel event queue cannot be created.
+   * @throws std::runtime_error If the run loop sources cannot be created.
    */
   inline explicit dispatcher_host_cfrunloop_auto(dispatcher_group& group)
       : dispatcher_host_cfrunloop_base(&group, true) {}

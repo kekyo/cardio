@@ -1,7 +1,7 @@
 # POSIXファイルディスクリプタの待機
 
 POSIX環境では、ファイルディスクリプタのreadinessを `promise` として待機できます。
-この機能は `_POSIX_C_SOURCE` または `CARDIO_HAS_POSIX_FD=1` が有効なビルドでのみ公開されます。
+Apple・Android 向けのビルドと、`_POSIX_C_SOURCE` を定義した POSIX 環境では既定で有効です。ESP-IDF では `CONFIG_VFS_SUPPORT_SELECT` の設定に従います。アプリからは `#if CARDIO_HAS_POSIX_FD` で判定できます。
 非POSIXビルドでは、`fd_event` と `from_fd()` は公開されません。
 `cardio::from_fd()` は、指定したファイルディスクリプタが読み取り可能、または書き込み可能になるまで待機し、実際に発生した状態を `fd_event` で返します:
 
