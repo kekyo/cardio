@@ -18,6 +18,10 @@
 #define CARDIO_WITH_GLIB 0
 #endif
 
+#ifndef CARDIO_WITH_CFRUNLOOP
+#define CARDIO_WITH_CFRUNLOOP 0
+#endif
+
 #ifndef CARDIO_WITH_GIO
 #define CARDIO_WITH_GIO 0
 #endif
@@ -210,6 +214,16 @@
 #define CARDIO_DISPATCHER_HOST_KQUEUE 1
 #include <map>
 #include <sys/event.h>
+#endif
+
+#if CARDIO_WITH_CFRUNLOOP
+#ifndef CARDIO_DISPATCHER_HOST_KQUEUE
+#error "CARDIO_WITH_CFRUNLOOP requires an Apple target with POSIX fd waits"
+#endif
+#include <CoreFoundation/CFDate.h>
+#include <CoreFoundation/CFFileDescriptor.h>
+#include <CoreFoundation/CFRunLoop.h>
+#define CARDIO_DISPATCHER_HOST_CFRUNLOOP 1
 #endif
 
 #if defined(__ANDROID__)
@@ -460,6 +474,9 @@ class dispatcher_host_glib_auto;
 #endif
 
 namespace internal {
+#ifdef CARDIO_DISPATCHER_HOST_CFRUNLOOP
+  class dispatcher_host_cfrunloop_base;
+#endif
 #if defined(__ANDROID__)
   class dispatcher_host_android_base;
 #endif
@@ -1831,6 +1848,7 @@ namespace internal {
 #ifdef CARDIO_DISPATCHER_HOST_KQUEUE
     inline explicit posix_fd_wait_backend(kqueue_tag)
         : kqueue_(std::make_unique<kqueue_fd_wait_backend>()) {}
+    inline int kqueue_descriptor() const noexcept { return kqueue_->descriptor(); }
 #endif
 
     inline bool empty() const noexcept {
@@ -2869,6 +2887,9 @@ private:
   friend class dispatcher;
   friend struct internal::dispatcher_lifetime;
   friend class dispatcher_host;
+#ifdef CARDIO_DISPATCHER_HOST_CFRUNLOOP
+  friend class internal::dispatcher_host_cfrunloop_base;
+#endif
 #if defined(__ANDROID__)
   friend class internal::dispatcher_host_android_base;
 #endif
@@ -3076,6 +3097,9 @@ private:
   friend class dispatcher_host;
 #ifdef CARDIO_DISPATCHER_HOST_KQUEUE
   friend class dispatcher_host_kqueue;
+#endif
+#ifdef CARDIO_DISPATCHER_HOST_CFRUNLOOP
+  friend class internal::dispatcher_host_cfrunloop_base;
 #endif
 #if defined(__ANDROID__)
   friend class internal::dispatcher_host_android_base;
@@ -4177,13 +4201,14 @@ private:
 protected:
 #ifdef CARDIO_DISPATCHER_HOST_KQUEUE
   // Create the kernel queue before publishing this dispatcher in the group.
-  inline dispatcher(internal::kqueue_tag tag, dispatcher_group* shared_group)
+  inline dispatcher(internal::kqueue_tag tag, dispatcher_group* shared_group,
+                    bool register_immediately = true)
       : features_(default_features()),
         owned_group_(shared_group ? nullptr : std::make_unique<dispatcher_group>()),
         group_(shared_group ? shared_group : owned_group_.get()),
         lifetime_(std::make_shared<internal::dispatcher_lifetime>(this, group_->lifetime_)),
         fd_waits_(tag) {
-    group_->register_dispatcher(this);
+    if (register_immediately) group_->register_dispatcher(this);
   }
 #endif
   /**
@@ -4608,6 +4633,250 @@ public:
   inline void park(shutdown_mode mode = shutdown_mode::gentle) {
     park_native(mode, park_policy::continuation_first);
   }
+};
+#endif
+
+#ifdef CARDIO_DISPATCHER_HOST_CFRUNLOOP
+namespace internal {
+  class dispatcher_host_cfrunloop_base : public dispatcher {
+    CFRunLoopRef loop_ = nullptr;
+    CFRunLoopSourceRef work_source_ = nullptr;
+    CFFileDescriptorRef descriptor_ = nullptr;
+    CFRunLoopSourceRef fd_source_ = nullptr;
+    CFRunLoopTimerRef timer_ = nullptr;
+    std::optional<std::chrono::steady_clock::time_point> armed_deadline_;
+    internal::mutex wake_mutex_;
+    bool attached_ = false;
+    shutdown_mode mode_ = shutdown_mode::gentle;
+
+    inline void discard_timer() noexcept {
+      armed_deadline_.reset();
+      if (timer_) {
+        CFRunLoopTimerInvalidate(timer_);
+        CFRelease(timer_);
+        timer_ = nullptr;
+      }
+    }
+
+    inline void refresh_timer() {
+      std::optional<std::chrono::steady_clock::time_point> deadline;
+      {
+        auto lock = std::lock_guard<internal::mutex>(mutex_);
+        deadline = next_timer_deadline();
+      }
+      if (deadline == armed_deadline_) return;
+      discard_timer();
+      if (!deadline) return;
+      // Cardio deadlines are monotonic. Recheck that deadline when CF fires.
+      const std::chrono::duration<double> remaining = *deadline - std::chrono::steady_clock::now();
+      CFRunLoopTimerContext context{};
+      context.info = this;
+      timer_ = CFRunLoopTimerCreate(nullptr, CFAbsoluteTimeGetCurrent() + std::max(0.0, remaining.count()),
+          0, 0, 0, [](CFRunLoopTimerRef, void* info) {
+            auto& host = *static_cast<dispatcher_host_cfrunloop_base*>(info);
+            host.discard_timer();
+            host.perform();
+          }, &context);
+      if (!timer_) fail_runtime_error("cardio: cannot create CFRunLoop timer");
+      armed_deadline_ = deadline;
+      CFRunLoopAddTimer(loop_, timer_, kCFRunLoopCommonModes);
+    }
+
+    inline bool dispatch_one() {
+      if (group_->should_exit_immediately(mode_)) return false;
+      dispatcher::wait_snapshot snapshot;
+      {
+        auto lock = std::lock_guard<internal::mutex>(mutex_);
+        snapshot = make_wait_snapshot();
+      }
+      wait_for_snapshot(snapshot, 0);
+      collect_ready_wait_snapshot(snapshot);
+      work_item work;
+      {
+        auto lock = std::lock_guard<internal::mutex>(mutex_);
+        if (!queue_.empty() && !group_->should_exit_immediately(mode_)) {
+          work = std::move(queue_.front());
+          queue_.pop_front();
+          ++active_continuations_;
+        }
+      }
+      if (work) {
+        // Two sources on the same run loop can belong to different dispatchers.
+        auto& current = internal::runtime_state().current_dispatcher;
+        struct restore_current {
+          dispatcher*& slot;
+          dispatcher* previous;
+          ~restore_current() { slot = previous; }
+        } scope{current, std::exchange(current, this)};
+        execute_dequeued_work(work, {}, mode_);
+      }
+      refresh_timer();
+      {
+        auto lock = std::lock_guard<internal::mutex>(mutex_);
+        if (!queue_.empty()) notify_external_event();
+      }
+      return static_cast<bool>(work);
+    }
+
+    inline void perform() noexcept {
+      if (!attached_) return;
+#if CARDIO_HAS_EXCEPTIONS
+      try {
+        dispatch_one();
+      } catch (...) {
+        handle_unhandled_exception(std::current_exception());
+      }
+#else
+      dispatch_one();
+#endif
+    }
+
+    inline void attach() {
+      CFRunLoopAddSource(loop_, work_source_, kCFRunLoopCommonModes);
+      CFRunLoopAddSource(loop_, fd_source_, kCFRunLoopCommonModes);
+      attached_ = true;
+      CFFileDescriptorEnableCallBacks(descriptor_, kCFFileDescriptorReadCallBack);
+      notify_external_event();
+    }
+
+    inline void detach() noexcept {
+      if (!attached_) return;
+      attached_ = false;
+      CFFileDescriptorDisableCallBacks(descriptor_, kCFFileDescriptorReadCallBack);
+      CFRunLoopRemoveSource(loop_, fd_source_, kCFRunLoopCommonModes);
+      CFRunLoopRemoveSource(loop_, work_source_, kCFRunLoopCommonModes);
+      discard_timer();
+    }
+
+    inline void dispose() noexcept {
+      detach();
+      if (fd_source_) {
+        CFRunLoopSourceInvalidate(fd_source_);
+        CFRelease(fd_source_);
+      }
+      if (descriptor_) {
+        CFFileDescriptorInvalidate(descriptor_);
+        CFRelease(descriptor_);
+      }
+      auto lock = std::lock_guard<internal::mutex>(wake_mutex_);
+      if (work_source_) {
+        CFRunLoopSourceInvalidate(work_source_);
+        CFRelease(work_source_);
+        work_source_ = nullptr;
+      }
+      if (loop_) CFRelease(loop_);
+      loop_ = nullptr;
+    }
+
+    inline void notify_external_event() noexcept override {
+      auto lock = std::lock_guard<internal::mutex>(wake_mutex_);
+      if (work_source_) {
+        CFRunLoopSourceSignal(work_source_);
+        CFRunLoopWakeUp(loop_);
+      }
+    }
+
+  protected:
+    inline dispatcher_host_cfrunloop_base(dispatcher_group* shared_group, bool automatic)
+        : dispatcher(kqueue_tag{}, shared_group, false) {
+      owner_thread_id_ = internal::current_thread_id();
+      loop_ = CFRunLoopGetCurrent();
+      CFRetain(loop_);
+      CFRunLoopSourceContext work_context{};
+      work_context.info = this;
+      work_context.perform = [](void* info) { static_cast<dispatcher_host_cfrunloop_base*>(info)->perform(); };
+      work_source_ = CFRunLoopSourceCreate(nullptr, 0, &work_context);
+      CFFileDescriptorContext fd_context{};
+      fd_context.info = this;
+      // The dispatcher owns the kqueue. CF only observes its read readiness.
+      descriptor_ = CFFileDescriptorCreate(nullptr, fd_waits_.kqueue_descriptor(), false,
+          [](CFFileDescriptorRef descriptor, CFOptionFlags, void* info) {
+            auto& host = *static_cast<dispatcher_host_cfrunloop_base*>(info);
+            host.perform();
+            if (host.attached_) CFFileDescriptorEnableCallBacks(descriptor, kCFFileDescriptorReadCallBack);
+          }, &fd_context);
+      if (descriptor_) fd_source_ = CFFileDescriptorCreateRunLoopSource(nullptr, descriptor_, 0);
+      if (!work_source_ || !fd_source_) {
+        dispose();
+        fail_runtime_error("cardio: cannot create CFRunLoop sources");
+      }
+#if CARDIO_HAS_EXCEPTIONS
+      try {
+#endif
+        if (automatic) attach();
+        group_->register_dispatcher(this);
+#if CARDIO_HAS_EXCEPTIONS
+      } catch (...) {
+        dispose();
+        throw;
+      }
+#endif
+    }
+
+    inline ~dispatcher_host_cfrunloop_base() override {
+      group_->unregister_dispatcher(this);
+      dispose();
+    }
+
+    inline void park_loop(shutdown_mode mode) {
+      if (!is_current_thread_owner()) fail_runtime_error("cardio: CFRunLoop must be parked on its owner thread");
+      if (attached_) fail_runtime_error("cardio: CFRunLoop dispatcher is already parked");
+      mode_ = mode;
+      attach();
+      struct detach_on_return {
+        dispatcher_host_cfrunloop_base& host;
+        ~detach_on_return() { host.detach(); }
+      } scope{*this};
+      for (;;) {
+        if (group_->should_exit(mode)) {
+          // Gentle shutdown still delivers already-ready timers and fds.
+          if (mode == shutdown_mode::gentle && group_->is_shutdown_requested() && dispatch_one()) continue;
+          return;
+        }
+        const auto result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0e10, true);
+        if (result == kCFRunLoopRunStopped || result == kCFRunLoopRunFinished) return;
+      }
+    }
+  };
+}  // namespace internal
+
+/**
+ * Drives both cardio work and application sources on the current CFRunLoop.
+ * @remarks Construct, park and destroy the host on the run loop's owner thread.
+ */
+class dispatcher_host_cfrunloop final : public internal::dispatcher_host_cfrunloop_base {
+public:
+  /** Creates a host with its own group on the current thread. */
+  inline dispatcher_host_cfrunloop() : dispatcher_host_cfrunloop_base(nullptr, false) {}
+  /**
+   * Creates a host on the current thread in an existing dispatcher group.
+   * @param group Group coordinating shutdown and outstanding work.
+   */
+  inline explicit dispatcher_host_cfrunloop(dispatcher_group& group)
+      : dispatcher_host_cfrunloop_base(&group, false) {}
+  /**
+   * Runs the default run loop mode and dispatches cardio work until the group exits.
+   * @param mode How to handle outstanding work at shutdown.
+   * @throws std::runtime_error When parked recursively or on another thread.
+   */
+  inline void park(shutdown_mode mode = shutdown_mode::gentle) { park_loop(mode); }
+};
+
+/**
+ * Dispatches cardio work from an existing CFRunLoop, including AppKit and UIKit main loops.
+ * @remarks Construct and destroy the host on the loop's owner thread. Sources
+ * and timers participate in common modes while the application drives its loop.
+ */
+class dispatcher_host_cfrunloop_auto final : public internal::dispatcher_host_cfrunloop_base {
+public:
+  /** Attaches to the current run loop with an implicit dispatcher group. */
+  inline dispatcher_host_cfrunloop_auto() : dispatcher_host_cfrunloop_base(nullptr, true) {}
+  /**
+   * Attaches to the current run loop in an existing dispatcher group.
+   * @param group Group coordinating shutdown and outstanding work.
+   */
+  inline explicit dispatcher_host_cfrunloop_auto(dispatcher_group& group)
+      : dispatcher_host_cfrunloop_base(&group, true) {}
 };
 #endif
 

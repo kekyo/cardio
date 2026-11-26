@@ -177,10 +177,12 @@ $(BUILD_DIR)/%: tests/%.cpp include/cardio.h tests/test_helpers.h | $(BUILD_DIR)
 $(WIN32_BUILD_DIR)/%.exe: tests/%.cpp include/cardio.h tests/test_helpers.h Makefile | $(WIN32_BUILD_DIR)
 	$(WIN32_CXX) $(CXXOPT) $(WIN32_CXXFLAGS) $< -o $@ $(WIN32_LDFLAGS) $(WIN32_LDLIBS)
 
-$(ANDROID_X86_64_CONFIG_TEST_OBJ): $(ANDROID_CONFIG_TEST_SRC) include/cardio.h Makefile | $(ANDROID_X86_64_BUILD_DIR)
+$(ANDROID_X86_64_CONFIG_TEST_OBJ): $(ANDROID_CONFIG_TEST_SRC) tests/cardio_host_selection_test.cpp include/cardio.h Makefile | $(ANDROID_X86_64_BUILD_DIR)
+	$(ANDROID_X86_64_CXX) $(CXXOPT) $(ANDROID_CXXFLAGS) -fsyntax-only tests/cardio_host_selection_test.cpp
 	$(ANDROID_X86_64_CXX) $(CXXOPT) $(ANDROID_CXXFLAGS) -c $< -o $@
 
-$(ANDROID_ARM64_CONFIG_TEST_OBJ): $(ANDROID_CONFIG_TEST_SRC) include/cardio.h Makefile | $(ANDROID_ARM64_BUILD_DIR)
+$(ANDROID_ARM64_CONFIG_TEST_OBJ): $(ANDROID_CONFIG_TEST_SRC) tests/cardio_host_selection_test.cpp include/cardio.h Makefile | $(ANDROID_ARM64_BUILD_DIR)
+	$(ANDROID_ARM64_CXX) $(CXXOPT) $(ANDROID_CXXFLAGS) -fsyntax-only tests/cardio_host_selection_test.cpp
 	$(ANDROID_ARM64_CXX) $(CXXOPT) $(ANDROID_CXXFLAGS) -c $< -o $@
 
 $(ANDROID_X86_64_MANUAL_TEST_BIN): $(ANDROID_MANUAL_TEST_SRC) include/cardio.h tests/test_helpers.h Makefile | $(ANDROID_X86_64_BUILD_DIR)
