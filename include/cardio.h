@@ -206,6 +206,12 @@
 #include <unistd.h>
 #endif
 
+#if defined(__APPLE__) && CARDIO_HAS_POSIX_FD
+#define CARDIO_DISPATCHER_HOST_KQUEUE 1
+#include <map>
+#include <sys/event.h>
+#endif
+
 #if defined(__ANDROID__)
 #include <android/looper.h>
 #include <sys/eventfd.h>
@@ -1515,9 +1521,183 @@ namespace internal {
     return events;
   }
 
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+  struct kqueue_tag {};
+
+  class kqueue_fd_wait_backend {
+    struct subscription {
+      std::vector<std::shared_ptr<fd_wait_state>> waits;
+      std::uintptr_t read_token = 0;
+      std::uintptr_t write_token = 0;
+      fd_event ready = fd_event::none;
+    };
+    int descriptor_;
+    std::map<int, subscription> subscriptions_;
+    std::vector<int> ready_fds_;
+    std::uintptr_t next_token_ = 0;
+
+    inline int change(const struct kevent& event) const noexcept {
+      int result;
+      do {
+        result = ::kevent(descriptor_, &event, 1, nullptr, 0, nullptr);
+      } while (result < 0 && errno == EINTR);
+      return result;
+    }
+
+    inline void mark_ready(int fd, subscription& entry, fd_event events) {
+      if (entry.ready == fd_event::none) ready_fds_.push_back(fd);
+      entry.ready |= events;
+    }
+
+    inline void update_filter(int fd, subscription& entry, short filter,
+                              std::uintptr_t& token, bool wanted) {
+      if (wanted == (token != 0)) return;
+      struct kevent event{};
+      if (wanted) {
+        if ((entry.ready & fd_event::error) != fd_event::none) return;
+        // A stale delivery must not complete a new wait that reused the fd.
+        if (++next_token_ == 0) ++next_token_;
+        EV_SET(&event, fd, filter, EV_ADD | EV_ONESHOT, 0, 0,
+               reinterpret_cast<void*>(next_token_));
+        if (change(event) == 0) {
+          token = next_token_;
+        } else {
+          // Match poll's error readiness even if the fd was closed before registration.
+          mark_ready(fd, entry, fd_event::error);
+          notify();
+        }
+      } else {
+        EV_SET(&event, fd, filter, EV_DELETE, 0, 0, nullptr);
+        (void)change(event);  // A one-shot event may already be in flight.
+        token = 0;
+      }
+    }
+
+    inline void update_interests(int fd, subscription& entry) {
+      auto interests = fd_event::none;
+      for (const auto& wait : entry.waits) interests |= wait->interests;
+      update_filter(fd, entry, EVFILT_READ, entry.read_token,
+                    (interests & fd_event::read) != fd_event::none);
+      update_filter(fd, entry, EVFILT_WRITE, entry.write_token,
+                    (interests & fd_event::write) != fd_event::none);
+      if (entry.waits.empty()) subscriptions_.erase(fd);
+    }
+
+  public:
+    inline kqueue_fd_wait_backend() : descriptor_(::kqueue()) {
+      if (descriptor_ < 0) fail_system_error(errno, "cardio: kqueue failed");
+      struct kevent event{};
+      EV_SET(&event, 0, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, nullptr);
+      if (::fcntl(descriptor_, F_SETFD, FD_CLOEXEC) == -1 || change(event) == -1) {
+        const auto error = errno;
+        ::close(descriptor_);
+        fail_system_error(error, "cardio: cannot initialize kqueue");
+      }
+    }
+    inline ~kqueue_fd_wait_backend() { ::close(descriptor_); }
+    kqueue_fd_wait_backend(const kqueue_fd_wait_backend&) = delete;
+    kqueue_fd_wait_backend& operator=(const kqueue_fd_wait_backend&) = delete;
+
+    inline int descriptor() const noexcept { return descriptor_; }
+    inline bool empty() const noexcept { return subscriptions_.empty(); }
+    inline void notify() const noexcept {
+      struct kevent event{};
+      EV_SET(&event, 0, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
+      (void)change(event);
+    }
+
+    inline void register_wait(const std::shared_ptr<fd_wait_state>& wait) {
+      auto& entry = subscriptions_[wait->fd];
+      entry.waits.push_back(wait);
+      update_interests(wait->fd, entry);
+    }
+
+    inline void unregister_wait(const std::shared_ptr<fd_wait_state>& wait) noexcept {
+      const auto found = subscriptions_.find(wait->fd);
+      if (found == subscriptions_.end()) return;
+      auto& entry = found->second;
+      std::erase(entry.waits, wait);
+      update_interests(wait->fd, entry);
+    }
+
+    inline void clear() noexcept {
+      for (auto& [fd, entry] : subscriptions_) {
+        for (auto& wait : entry.waits) {
+          wait->registered = false;
+          wait->owner = nullptr;
+        }
+      }
+      subscriptions_.clear();
+      ready_fds_.clear();
+    }
+
+    // Only the parking thread blocks here. Registration and cancellation can
+    // proceed under the dispatcher's mutex while the kernel owns this wait.
+    static inline void wait(int descriptor, int milliseconds, std::vector<struct kevent>& events) {
+      struct timespec timeout{milliseconds / 1000, (milliseconds % 1000) * 1000000L};
+      const struct timespec zero{};
+      const auto* remaining = milliseconds < 0 ? nullptr : &timeout;
+      struct kevent batch[32];
+      for (;;) {
+        const auto count = ::kevent(descriptor, nullptr, 0, batch, 32, remaining);
+        if (count < 0) {
+          if (errno == EINTR) return;  // Recompute the timer deadline in park().
+          fail_system_error(errno, "cardio: kevent wait failed");
+        }
+        events.insert(events.end(), batch, batch + count);
+        if (count < 32) return;
+        remaining = &zero;  // Collect both filters even across a batch boundary.
+      }
+    }
+
+    inline std::vector<std::coroutine_handle<>> collect_ready(
+        const std::vector<struct kevent>& events) {
+      for (const auto& event : events) {
+        if (event.filter == EVFILT_USER) continue;
+        const auto fd = static_cast<int>(event.ident);
+        const auto found = subscriptions_.find(fd);
+        if (found == subscriptions_.end()) continue;
+        auto& entry = found->second;
+        auto& token = event.filter == EVFILT_READ ? entry.read_token : entry.write_token;
+        if (token == 0 || token != reinterpret_cast<std::uintptr_t>(event.udata)) continue;
+        token = 0;  // EV_ONESHOT removed this filter.
+        auto ready = event.filter == EVFILT_READ ? fd_event::read : fd_event::write;
+        if (event.flags & EV_EOF) ready |= fd_event::hangup;
+        if ((event.flags & EV_ERROR) || ((event.flags & EV_EOF) && event.fflags)) {
+          ready |= fd_event::error;
+        }
+        mark_ready(fd, entry, ready);
+      }
+
+      auto continuations = std::vector<std::coroutine_handle<>>{};
+      auto ready_fds = std::exchange(ready_fds_, {});
+      for (const auto fd : ready_fds) {
+        const auto found = subscriptions_.find(fd);
+        if (found == subscriptions_.end()) continue;
+        auto& entry = found->second;
+        const auto ready = std::exchange(entry.ready, fd_event::none);
+        std::erase_if(entry.waits, [&](const auto& wait) {
+          const auto result = ready & (wait->interests | fd_event::hangup | fd_event::error);
+          if (result == fd_event::none) return false;
+          wait->result = result;
+          wait->registered = false;
+          wait->owner = nullptr;
+          if (wait->continuation) continuations.push_back(wait->continuation);
+          return true;
+        });
+        update_interests(fd, entry);
+      }
+      return continuations;
+    }
+  };
+#endif
+
   class posix_fd_wait_backend {
   private:
     std::deque<std::shared_ptr<fd_wait_state>> waits_;
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+    std::unique_ptr<kqueue_fd_wait_backend> kqueue_;
+#endif
     int wakeup_read_fd_ = -1;
 #if !defined(ESP_PLATFORM)
     int wakeup_write_fd_ = -1;
@@ -1585,8 +1765,15 @@ namespace internal {
     struct snapshot {
       std::vector<pollfd> poll_fds;
       std::vector<std::shared_ptr<fd_wait_state>> waits;
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      int kqueue_fd = -1;
+      std::vector<struct kevent> events;
+#endif
 
       inline bool empty() const noexcept {
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+        if (kqueue_fd >= 0) return false;
+#endif
         return poll_fds.empty();
       }
     };
@@ -1641,11 +1828,22 @@ namespace internal {
     posix_fd_wait_backend(const posix_fd_wait_backend&) = delete;
     posix_fd_wait_backend& operator=(const posix_fd_wait_backend&) = delete;
 
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+    inline explicit posix_fd_wait_backend(kqueue_tag)
+        : kqueue_(std::make_unique<kqueue_fd_wait_backend>()) {}
+#endif
+
     inline bool empty() const noexcept {
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      if (kqueue_) return kqueue_->empty();
+#endif
       return waits_.empty();
     }
 
     inline void notify() noexcept {
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      if (kqueue_) return kqueue_->notify();
+#endif
 #if defined(ESP_PLATFORM)
       const auto value = uint64_t{1};
       const int fd = wakeup_read_fd_;
@@ -1672,6 +1870,9 @@ namespace internal {
       wait->continuation = continuation;
       wait->owner = owner;
       wait->registered = true;
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      if (kqueue_) return kqueue_->register_wait(wait);
+#endif
       waits_.push_back(std::move(wait));
     }
 
@@ -1684,6 +1885,12 @@ namespace internal {
 
       wait->owner = nullptr;
       wait->registered = false;
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      if (kqueue_) {
+        kqueue_->unregister_wait(wait);
+        return true;
+      }
+#endif
       for (auto iterator = waits_.begin(); iterator != waits_.end(); ++iterator) {
         if (iterator->get() == wait.get()) {
           waits_.erase(iterator);
@@ -1694,6 +1901,9 @@ namespace internal {
     }
 
     inline void clear(dispatcher* owner) noexcept {
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      if (kqueue_) return kqueue_->clear();
+#endif
       for (auto& wait : waits_) {
         if (wait && wait->owner == owner) {
           wait->owner = nullptr;
@@ -1707,6 +1917,12 @@ namespace internal {
         dispatcher* owner,
         bool include_wakeup_when_empty = false) {
       auto result = snapshot{};
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      if (kqueue_) {
+        if (include_wakeup_when_empty || !kqueue_->empty()) result.kqueue_fd = kqueue_->descriptor();
+        return result;
+      }
+#endif
       result.poll_fds.reserve(waits_.size() + 1);
       result.waits.reserve(waits_.size());
 
@@ -1772,6 +1988,9 @@ namespace internal {
     inline std::vector<std::coroutine_handle<>> collect_ready(
         dispatcher* owner,
         const snapshot& snapshot) {
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      if (kqueue_) return kqueue_->collect_ready(snapshot.events);
+#endif
       auto continuations = std::vector<std::coroutine_handle<>>{};
 
       if (!snapshot.poll_fds.empty() && snapshot.poll_fds[0].revents != 0) {
@@ -2855,6 +3074,9 @@ class dispatcher {
 private:
   friend class dispatcher_group;
   friend class dispatcher_host;
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+  friend class dispatcher_host_kqueue;
+#endif
 #if defined(__ANDROID__)
   friend class internal::dispatcher_host_android_base;
 #endif
@@ -2991,6 +3213,8 @@ private:
 
   inline virtual void notify_external_event() noexcept {
   }
+
+  inline void park_native(shutdown_mode mode, park_policy policy);
 
 #if CARDIO_HAS_NATIVE_WAIT
   inline void mark_wait_polling(bool polling) noexcept {
@@ -3211,6 +3435,9 @@ private:
 
     inline bool empty() const noexcept {
 #if CARDIO_HAS_POSIX_FD
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+      if (fd_snapshot.kqueue_fd >= 0) return false;
+#endif
       return poll_fds.empty();
 #elif CARDIO_HAS_WIN32_HANDLE
       return win32_handle_snapshot.empty();
@@ -3251,6 +3478,13 @@ private:
     }
 
 #if CARDIO_HAS_POSIX_FD
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+    if (snapshot.fd_snapshot.kqueue_fd >= 0) {
+      internal::kqueue_fd_wait_backend::wait(snapshot.fd_snapshot.kqueue_fd,
+          timeout_milliseconds, snapshot.fd_snapshot.events);
+      return;
+    }
+#endif
     internal::fd_wait_backend::wait(snapshot.poll_fds, timeout_milliseconds);
 
     for (auto index = std::size_t{0};
@@ -3941,6 +4175,17 @@ private:
 #endif
 
 protected:
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+  // Create the kernel queue before publishing this dispatcher in the group.
+  inline dispatcher(internal::kqueue_tag tag, dispatcher_group* shared_group)
+      : features_(default_features()),
+        owned_group_(shared_group ? nullptr : std::make_unique<dispatcher_group>()),
+        group_(shared_group ? shared_group : owned_group_.get()),
+        lifetime_(std::make_shared<internal::dispatcher_lifetime>(this, group_->lifetime_)),
+        fd_waits_(tag) {
+    group_->register_dispatcher(this);
+  }
+#endif
   /**
    * Creates a dispatcher base.
    *
@@ -4119,6 +4364,14 @@ public:
   inline void park(
       shutdown_mode mode = shutdown_mode::gentle,
       park_policy policy = park_policy::external_pump_first) {
+    park_native(mode, policy);
+  }
+
+  dispatcher_host(const dispatcher_host&) = delete;
+  dispatcher_host& operator=(const dispatcher_host&) = delete;
+};
+
+inline void dispatcher::park_native(shutdown_mode mode, park_policy policy) {
     if (owner_thread_id_ != internal::thread_id{} &&
         !is_current_thread_owner()) {
       internal::fail_runtime_error(
@@ -4311,11 +4564,52 @@ public:
         execute_dequeued_work(work, {}, mode);
       }
     }
+}
+
+#ifdef CARDIO_DISPATCHER_HOST_KQUEUE
+/**
+ * Dispatches continuations, timers and POSIX fd readiness using an Apple kqueue.
+ * @remarks The application drives this host by calling park(). Registered fds
+ * remain owned by the caller.
+ */
+class dispatcher_host_kqueue final : public dispatcher {
+public:
+  /**
+   * Creates a host with its own dispatcher group.
+   * @param policy Whether to bind execution to the constructing thread.
+   * @throws std::system_error If the kernel event queue cannot be initialized.
+   */
+  inline explicit dispatcher_host_kqueue(
+      dispatcher_thread_policy policy = dispatcher_thread_policy::any_thread)
+      : dispatcher(internal::kqueue_tag{}, nullptr) {
+    if (policy == dispatcher_thread_policy::current_thread) {
+      owner_thread_id_ = internal::current_thread_id();
+    }
   }
 
-  dispatcher_host(const dispatcher_host&) = delete;
-  dispatcher_host& operator=(const dispatcher_host&) = delete;
+  /**
+   * Creates a host in an existing dispatcher group.
+   * @param group Group coordinating shutdown and outstanding work.
+   * @param policy Whether to bind execution to the constructing thread.
+   * @throws std::system_error If the kernel event queue cannot be initialized.
+   */
+  inline explicit dispatcher_host_kqueue(dispatcher_group& group,
+      dispatcher_thread_policy policy = dispatcher_thread_policy::any_thread)
+      : dispatcher(internal::kqueue_tag{}, &group) {
+    if (policy == dispatcher_thread_policy::current_thread) {
+      owner_thread_id_ = internal::current_thread_id();
+    }
+  }
+
+  /**
+   * Runs queued work and waits for timers and registered file descriptors.
+   * @param mode How to handle outstanding work when the group shuts down.
+   */
+  inline void park(shutdown_mode mode = shutdown_mode::gentle) {
+    park_native(mode, park_policy::continuation_first);
+  }
 };
+#endif
 
 #if CARDIO_HAS_WIN32_HANDLE
 /**
