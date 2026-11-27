@@ -45,6 +45,41 @@ EOF
 (cd mac-entry && PATH="$work/mac-entry:$PATH" "$root/build.sh" && test -f native-tests-ran)
 echo 'Native macOS build entry point: PASS'
 
+# simctl can report only the PID. Use the outcome recorded by this app launch.
+mkdir -p ios-tools "simulator data/tmp"
+ln -s /bin/true ios-tools/codesign
+cat > ios-tools/xcrun <<'EOF'
+#!/bin/sh
+set -eu
+case "$1:$2" in
+    simctl:create) echo ios-test-device ;;
+    simctl:get_app_container) echo "$IOS_TEST_DATA" ;;
+    simctl:launch)
+        echo 'com.example.cardio.runloop-test: 4113'
+        report=${SIMCTL_CHILD_CARDIO_TEST_REPORT:-"$IOS_TEST_DATA/tmp/uncollected.log"}
+        case "$IOS_TEST_CASE" in
+            completed) echo 'cardio_ios_cfrunloop_test: PASS' > "$report" ;;
+            interrupted) echo 'Waiting for the pipe' > "$report" ;;
+            missing) echo 'cardio_ios_cfrunloop_test: PASS' ;;
+            launch-error) echo 'cardio_ios_cfrunloop_test: PASS' > "$report"; exit 17 ;;
+        esac
+        ;;
+esac
+EOF
+chmod +x ios-tools/xcrun
+for ios_case in completed interrupted missing launch-error; do
+    status=0
+    (cd "$root" && PATH="$work/ios-tools:$PATH" IOS_TEST_DATA="$work/simulator data" \
+        IOS_TEST_CASE="$ios_case" sh tests/ios/verify.sh "$work/ios") > ios.log 2>&1 || status=$?
+    case "$ios_case:$status" in
+        completed:0) grep -Fxq 'cardio_ios_cfrunloop_test: PASS' ios.log ;;
+        interrupted:1) grep -Fxq 'Waiting for the pipe' ios.log ;;
+        missing:1|launch-error:17) ;;
+        *) cat ios.log >&2; echo "Unexpected iOS result for $ios_case: $status" >&2; exit 1 ;;
+    esac
+done
+echo 'UIKit Simulator test results: PASS'
+
 dll=build/win32/shared/libcardio.dll
 make -C "$root" -B -n -j4 WIN32_CXX=link-probe "$dll" "$dll.a" > win32-commands
 links=$(awk '$1 == "link-probe" { count++ } END { print count + 0 }' win32-commands)
